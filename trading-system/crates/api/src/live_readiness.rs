@@ -286,6 +286,16 @@ async fn calculate_paper_trading_evidence(pool: &PgPool) -> Result<PaperTradingE
             FROM orders
             WHERE mode = 'paper'
         ),
+        paper_protection AS (
+            SELECT protection.id, protection.position_id
+            FROM protection_orders protection
+            JOIN paper_orders orders ON orders.id = protection.entry_order_id
+        ),
+        paper_positions AS (
+            SELECT positions.id, positions.opened_at
+            FROM positions
+            JOIN paper_protection ON paper_protection.position_id = positions.id
+        ),
         observed_times AS (
             SELECT created_at AS observed_at FROM paper_orders
             UNION ALL
@@ -293,9 +303,7 @@ async fn calculate_paper_trading_evidence(pool: &PgPool) -> Result<PaperTradingE
             FROM order_fills fills
             JOIN paper_orders orders ON orders.id = fills.order_id
             UNION ALL
-            SELECT positions.opened_at AS observed_at
-            FROM positions
-            WHERE exchange IN ('binance', 'bybit', 'bitget')
+            SELECT opened_at AS observed_at FROM paper_positions
             UNION ALL
             SELECT exits.triggered_at AS observed_at
             FROM paper_exits exits
@@ -309,8 +317,8 @@ async fn calculate_paper_trading_evidence(pool: &PgPool) -> Result<PaperTradingE
                 FROM order_fills fills
                 JOIN paper_orders orders ON orders.id = fills.order_id
             ) AS fills,
-            (SELECT COUNT(*)::bigint FROM positions) AS positions,
-            (SELECT COUNT(*)::bigint FROM protection_orders) AS protection_orders,
+            (SELECT COUNT(*)::bigint FROM paper_positions) AS positions,
+            (SELECT COUNT(*)::bigint FROM paper_protection) AS protection_orders,
             (SELECT COUNT(*)::bigint FROM paper_exits) AS paper_exits
         "#,
     )
@@ -519,4 +527,235 @@ fn api_error(error: TradingError) -> axum::response::Response {
         Json(json!({ "error": error.to_string() })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use sqlx::postgres::PgPoolOptions;
+
+    async fn test_pool() -> Option<PgPool> {
+        let database_url = std::env::var("TEST_DATABASE_URL").ok()?;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect test database");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        Some(pool)
+    }
+
+    /// A seeded order + linked position, returned so the test can both assert on
+    /// it and clean it up afterwards.
+    #[derive(Clone, Copy)]
+    struct SeededTrade {
+        order_id: Uuid,
+        position_id: Uuid,
+    }
+
+    /// Inserts a fully linked order+fill+position+protection set in one mode at
+    /// the given timestamp. Used to seed both paper and non-paper evidence.
+    async fn seed_trade(
+        pool: &PgPool,
+        mode: &str,
+        symbol: &str,
+        observed_at: DateTime<Utc>,
+    ) -> SeededTrade {
+        let order_id = Uuid::new_v4();
+        let position_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO orders (id, exchange, mode, symbol, side, order_type, status, quantity, created_at)
+               VALUES ($1, 'binance', $2, $3, 'buy', 'market', 'filled', 1, $4)"#,
+        )
+        .bind(order_id)
+        .bind(mode)
+        .bind(symbol)
+        .bind(observed_at)
+        .execute(pool)
+        .await
+        .expect("insert order");
+        sqlx::query(
+            r#"INSERT INTO order_fills (order_id, exchange, symbol, side, price, quantity, filled_at)
+               VALUES ($1, 'binance', $2, 'buy', 50000, 1, $3)"#,
+        )
+        .bind(order_id)
+        .bind(symbol)
+        .bind(observed_at)
+        .execute(pool)
+        .await
+        .expect("insert fill");
+        sqlx::query(
+            r#"INSERT INTO positions (id, exchange, symbol, side, entry_price, mark_price, quantity, leverage, unrealized_pnl, opened_at)
+               VALUES ($1, 'binance', $2, 'long', 50000, 50000, 1, 1, 0, $3)"#,
+        )
+        .bind(position_id)
+        .bind(symbol)
+        .bind(observed_at)
+        .execute(pool)
+        .await
+        .expect("insert position");
+        sqlx::query(
+            r#"INSERT INTO protection_orders (id, entry_order_id, position_id, stop_loss_price, take_profit_price, status, created_at)
+               VALUES ($1, $2, $3, 49000, 51000, 'active', $4)"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(order_id)
+        .bind(position_id)
+        .bind(observed_at)
+        .execute(pool)
+        .await
+        .expect("insert protection");
+
+        SeededTrade {
+            order_id,
+            position_id,
+        }
+    }
+
+    /// Removes the rows a test seeded so the shared integration DB stays clean and
+    /// other aggregate tests are not skewed.
+    async fn cleanup_trades(pool: &PgPool, trades: &[SeededTrade]) {
+        for trade in trades {
+            sqlx::query("DELETE FROM protection_orders WHERE entry_order_id = $1")
+                .bind(trade.order_id)
+                .execute(pool)
+                .await
+                .expect("cleanup protection");
+            sqlx::query("DELETE FROM positions WHERE id = $1")
+                .bind(trade.position_id)
+                .execute(pool)
+                .await
+                .expect("cleanup position");
+            sqlx::query("DELETE FROM order_fills WHERE order_id = $1")
+                .bind(trade.order_id)
+                .execute(pool)
+                .await
+                .expect("cleanup fill");
+            sqlx::query("DELETE FROM orders WHERE id = $1")
+                .bind(trade.order_id)
+                .execute(pool)
+                .await
+                .expect("cleanup order");
+        }
+    }
+
+    /// Counts how many of the given position ids the paper-scoped 14d evidence
+    /// query would include. Mirrors the `paper_positions` CTE in
+    /// `calculate_paper_trading_evidence` so the assertion is race-proof: it only
+    /// looks at rows this test inserted, not at paper data other tests leave.
+    async fn paper_scoped_position_count(pool: &PgPool, position_ids: &[Uuid]) -> i64 {
+        sqlx::query(
+            r#"
+            SELECT COUNT(*)::bigint AS count
+            FROM positions
+            JOIN protection_orders protection ON protection.position_id = positions.id
+            JOIN orders ON orders.id = protection.entry_order_id
+            WHERE orders.mode = 'paper'
+              AND positions.id = ANY($1)
+            "#,
+        )
+        .bind(position_ids)
+        .fetch_one(pool)
+        .await
+        .expect("count paper-scoped positions")
+        .get::<i64, _>("count")
+    }
+
+    // Regression: the 14d paper-trading gate must count only paper-mode positions
+    // and protection orders. A 20-day-old testnet trade alone must NOT satisfy the
+    // gate, otherwise non-paper evidence could unlock live mode (runbook.md).
+    #[tokio::test]
+    async fn paper_trading_gate_ignores_non_paper_positions() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping DB integration test; TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let now = Utc::now();
+        let old = now - Duration::days(20);
+
+        // Two testnet trades spanning 20 days: must contribute nothing to the
+        // paper gate. Assert on exactly these rows so the test is race-proof.
+        let p1 = seed_trade(
+            &pool,
+            "testnet",
+            &format!("TN{}", Uuid::new_v4().simple()),
+            old,
+        )
+        .await;
+        let p2 = seed_trade(
+            &pool,
+            "testnet",
+            &format!("TN{}", Uuid::new_v4().simple()),
+            now,
+        )
+        .await;
+
+        let counted = paper_scoped_position_count(&pool, &[p1.position_id, p2.position_id]).await;
+        cleanup_trades(&pool, &[p1, p2]).await;
+        assert_eq!(
+            counted, 0,
+            "testnet positions must not count toward the paper gate"
+        );
+    }
+
+    // Paper-mode trades spanning >=14 days must satisfy the gate.
+    #[tokio::test]
+    async fn paper_trading_gate_passes_on_paper_evidence() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping DB integration test; TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let now = Utc::now();
+        let old = now - Duration::days(20);
+
+        let p1 = seed_trade(
+            &pool,
+            "paper",
+            &format!("PA{}", Uuid::new_v4().simple()),
+            old,
+        )
+        .await;
+        let p2 = seed_trade(
+            &pool,
+            "paper",
+            &format!("PA{}", Uuid::new_v4().simple()),
+            now,
+        )
+        .await;
+
+        // The two paper positions this test inserted are both counted.
+        let counted = paper_scoped_position_count(&pool, &[p1.position_id, p2.position_id]).await;
+
+        // And the gate as a whole is satisfied (other tests guarantee fills exist;
+        // these inserts guarantee the >=14 day span and positive counts).
+        let evidence = calculate_paper_trading_evidence(&pool)
+            .await
+            .expect("evidence");
+
+        cleanup_trades(&pool, &[p1, p2]).await;
+
+        assert_eq!(
+            counted, 2,
+            "both paper positions must count toward the gate"
+        );
+        assert!(evidence.positions >= 2, "paper positions must be counted");
+        assert!(
+            evidence.protection_orders >= 2,
+            "paper protection orders must be counted"
+        );
+        assert!(
+            evidence.observed_days >= 14,
+            "paper span must reflect paper trades"
+        );
+        assert!(
+            evidence.passed,
+            "gate must pass on sufficient paper evidence"
+        );
+    }
 }

@@ -1246,6 +1246,19 @@ mod tests {
     ) -> (ReconcileOutcome, bool, SharedRuntimeControl) {
         let control = fresh_control();
         let (tx, _rx) = mpsc::channel::<String>(8);
+        // The reconcile signal id below is referenced by orders.signal_id (a FK to
+        // signals.id). In production the signal row is persisted before the entry
+        // order, so seed it here too; otherwise persist_protected_order fails the
+        // FK and the happy path locks spuriously.
+        sqlx::query(
+            r#"INSERT INTO signals (id, symbol, side, strategy, score, reason)
+               VALUES ($1, 'BTCUSDT', 'buy', 'reconcile-test', 0, 'reconcile-test')
+               ON CONFLICT (id) DO NOTHING"#,
+        )
+        .bind(uuid::Uuid::nil())
+        .execute(pool)
+        .await
+        .expect("seed reconcile signal");
         let outcome = reconcile_entry_timeout(
             adapter,
             pool,

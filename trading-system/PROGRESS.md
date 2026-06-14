@@ -1,10 +1,11 @@
 # PROGRESS — trading-system (Rust 코인선물 AI 트레이딩)
 
-> 마지막 갱신: 2026-06-14 (4차 세션). 다음 세션에서 이 파일부터 읽고 "재개 지점"으로 이동.
+> 마지막 갱신: 2026-06-15 (runbook 정합성 수정 — paper_trading_14d 게이트 mode 스코핑 + reconcile 테스트 FK). 다음 세션에서 이 파일부터 읽고 "재개 지점"으로 이동.
 
 ## 현재 상태 (한 줄)
-머니6종 + 후속 + reconcile + **latency-gate + Bitget 8h + 보호주문 Algo API 수정 완료**(4차 세션).
-**테스트 88 통과/0 실패, fmt clean, clippy 13(신규 0).** DB 통합테스트 0건 skip 확인.
+머니6종 + 후속 + reconcile + **latency-gate + Bitget 8h + 보호주문 Algo API + 출시 전 감사 P0/P1 + runbook 정합성 수정 완료**.
+**전체 테스트 single-threaded 0 실패, fmt clean, clippy warning 1(기존 ai_repository 인자 수).** ⚠️**병렬(`cargo test` 기본) 실행 시 `account_risk_state_counts_closed_position_without_paper_exit_as_realized`가 공유 DB 전역집계라 flaky** — 검증은 **`-- --test-threads=1`로 실행**(기존부터 그래왔음, 내 변경과 무관).
+✅ **runbook 정합성 수정 (2026-06-15)**: ①`paper_trading_14d` 게이트(라이브 해제용 머니게이트)가 runbook.md:96 명세("paper-mode" positions/protection)와 달리 `positions`/`protection_orders`를 **mode 필터 없이** 카운트 → **testnet 데이터만으로 라이브 게이트 통과 가능 결함**. `calculate_paper_trading_evidence`(`live_readiness.rs`)에 `paper_protection`/`paper_positions` CTE 추가(=`protection_orders.entry_order_id → orders.mode='paper'` 조인)로 스코핑. positions 테이블엔 mode 컬럼 없음→orders로만 추적. ②reconcile 해피패스 테스트(`testnet_runtime.rs`)가 `signal_id=nil`을 signals seed 없이 넘겨 FK위반→spurious LOCK → `run_reconcile`에 nil signal seed 추가(프로덕션은 signal 먼저 영속화하므로 정합). DB 통합테스트 3개 추가/수정, 실 PostgreSQL로 검증.
 ✅ **latency-gate 해결+라이브검증**: close_time 기준 측정 → 정상 캔들 0~128ms(수정전 7-20k). **실제 진입 주문 발생 확인**(11:58 ETHUSDT).
 ✅ **Bitget 8h 해결+라이브검증**: 스냅샷 배치(500개 오래된순)에서 `.next_back()` 최신행 → 8h→0ms.
 ✅ **보호주문(SL/TP) -4120 해결+testnet 200 검증**: Binance가 2025-12-09부로 조건부주문을 Algo Service 이전. `STOP_MARKET`/`TAKE_PROFIT_MARKET`을 `/fapi/v1/order`→**`/fapi/v1/algoOrder`**(`algoType=CONDITIONAL`, `stopPrice`→`triggerPrice`)로 변경. testnet 양쪽 HTTP 200·algoStatus:NEW. 커밋 `0fee96f`·`d389631`·`659f50e` 푸시 완료.
@@ -47,7 +48,7 @@
 - **함정 기록**: ⚠️**latency≠open_time 기준**(캔들은 close_time 기준이어야 정상틱이 fresh). 1m 캔들 경계틱도 open_time 기준이면 7-10초. 적대적 리뷰가 머니게이트에서 결정적(초기 진단 반증). DB 증거 우선(risk_events/candles/order_books). **타임아웃 트레이드오프**: 캔들 staleness 탐지창이 ~2s→~interval+2s(1m=62s)로 넓어짐(의도된 것, 실제 freeze 탐지는 오더북 경로+새 캔들 부재로)
 
 ## 🚀 다음 세션 첫 액션 (clear 후 여기부터)
-1. 위 "부팅 명령어" 복붙 → **88 passed / 0 failed · fmt clean · clippy 13** 확인(그린 베이스라인)
+1. 위 "부팅 명령어" 복붙 → **96 passed / 0 failed · fmt clean · clippy warning 1** 확인(그린 베이스라인)
 2. **세 버그 모두 해결·검증됨**(latency-gate / Bitget 8h / 보호주문 Algo). git `main` = `f936ab9` 동기화 완료.
 3. **⚙️ testnet 봇은 직전 세션 종료 시 kill 완료**(실행 중 아님). 다시 띄우려면 "재개 지점" 위의 봇 실행 명령 또는 `set -a; source .env; set +a && RUST_LOG=trading_api=debug,info cargo run -p trading-api --bin trading-api`. 검증 로그는 `/tmp/trading-bot-run3.log`(latency 0~128ms 확인 가능, 참고용).
 4. **다음 할 일(선택)**: 아래 "재개 지점"의 ①보호주문 e2e 라이브(진입→보호 전체경로, 시장 과매도 시 자연발생) ②position sweep ③signal.id 안정화 ④timeframe CI 가드. **급한 버그 없음** — 추가 작업 안 하면 현 상태로 종결 가능.
@@ -57,6 +58,17 @@
 - **`demo-fapi.binance.com` = 진짜 testnet 확정**: 사용자 testnet 키로 signed `GET /fapi/v3/account` → HTTP 200 + **testnet 가짜잔고**(USDT 5282·USDC 5000·BTC 0.01). 같은 키를 실거래 `fapi.binance.com`에 치면 **HTTP 401 `-2015`**(거부) → testnet 전용 확정, 실거래 자금 위험 없음
 - **testnet 모드 ON**: `.env`(gitignore, 커밋 안 됨) → `BINANCE_TESTNET_API_KEY/SECRET`(각 64자) 설정 + `BINANCE_TESTNET_ENABLED=true` + `TRADING_MODE=testnet` + `MARKET_DATA_ENABLED=true`(testnet 게이트 필수). `BINANCE_TESTNET_MAX_ORDER_NOTIONAL=50`(주문당 상한). ⚠️채팅으로 평문 전송된 키라 rotate 권장
 - 부팅 검증: `cargo run -p trading-api --bin trading-api` → settings 게이트 통과·API listening·시장스트림 수신 OK
+
+## ✅ 출시 전 감사 수정 진행 (2026-06-14)
+- **P0 Binance WS 라우팅 수정**: 기본 WS root=`wss://fstream.binance.com`. kline=`/market/stream?streams=...@kline_1m`, bookTicker=`/public/stream?streams=...@bookTicker`. Binance 2026 문서 기준 routed endpoint 대응.
+- **보호주문 partial success 보상**: `ProtectionOrderRequest`에 deterministic `clientAlgoId` 2개 추가(`entryUUID32-sl/tp`). Binance `DELETE /fapi/v1/algoOrder` 구현. TP leg 실패 시 이미 생성된 SL leg 취소, TP timeout이면 TP clientAlgoId도 best-effort 취소.
+- **testnet 영속화/재시작 복구**: 성공한 testnet entry/fill/position/protection을 기존 `orders/order_fills/positions/protection_orders`에 `mode=testnet`으로 저장. 시작 시 open testnet position key 복구해 재시작 중복 진입 방지.
+- **panic/manual close testnet 거래소 반영**: `TRADING_MODE=testnet`에서는 DB-only paper close 대신 Binance reduce-only market flatten + deterministic SL/TP algo cancel 수행. paper/testnet open protected order 로딩은 mode별로 분리.
+- **인증 기본값 강화**: backend는 non-loopback `API_HOST`에서 `DASHBOARD_CONTROL_TOKEN` 없으면 기동 실패. dashboard production runtime은 `DASHBOARD_PASSWORD`/`DASHBOARD_SESSION_SECRET` 없으면 인증 bypass가 아니라 500 설정 오류. `/ws/dashboard`도 header 또는 `?token=` 검증.
+- **testnet risk state 개선**: testnet entry risk gate가 hardcoded daily PnL 0 대신 DB 기반 `load_account_risk_state` 사용. candle close로 open position mark 갱신. paper_exit 없는 closed position도 mark/entry 기준 realized PnL로 계산.
+- **URL/시크릿 로그 누출 차단**: Binance signed URL/Telegram bot URL이 reqwest transport error 문자열에 포함되지 않도록 `without_url()` 적용.
+- **운영 정리**: `PAPER_TRADING_ENABLED=true` + `TRADING_MODE!=paper` 조합 차단. 주요 numeric env 양수 검증. dashboard `lint`는 Next 16에서 제거된 `next lint` 대신 `tsc --noEmit --incremental false`. `configs/example.env`에 dashboard password/session secret 추가. unused workspace direct dep `futures-core` 제거.
+- **검증 완료**: `cargo test --workspace` 통과(총 96 passed), `cargo clippy --workspace --all-targets` exit 0(잔여 warning 1개: 기존 `ai_repository::persist_ai_decision` 인자 수), `npm run lint` 통과, `npx tsc --noEmit` 통과, `npm run build` 통과.
 
 ## ▶ 재개 지점 — "남은 후속" (우선순위 순)
 1. **🟡 보호주문 e2e 라이브 확인 (선택)**: 보호주문 수정(`659f50e`)은 testnet에 직접 쏴서 200 검증 완료. 단 **실제 봇이 진입→보호주문까지 가는 전체 경로**는 시장이 과매도(RSI≤30)가 될 때 자연 발생. 봇 띄워두고 진입 시 보호주문 성공(LOCK 안 걸림)·실제 SL/TP 등록되는지 확인하면 100% 종결. (이미 11:58에 진입은 발생했고, 그땐 옛 코드라 -4120 LOCK. 새 코드론 통과 예상)
@@ -76,10 +88,10 @@ psql "$ADMIN_URL" -tAc "SELECT 1 FROM pg_database WHERE datname='trading_system_
   || psql "$ADMIN_URL" -c "CREATE DATABASE trading_system_test;"
 export TEST_DATABASE_URL="${DATABASE_URL%/*}/trading_system_test"
 
-# 2) 그린 베이스라인 확인 (반드시 88 passed / 0 failed 여야 함)
+# 2) 그린 베이스라인 확인 (반드시 96 passed / 0 failed 여야 함)
 cargo test --workspace 2>&1 | grep -oE "[0-9]+ passed" | awk '{s+=$1} END{print s" passed"}'
 cargo fmt --all -- --check && echo "fmt clean"
-cargo clippy --workspace --all-targets 2>&1 | grep -cE "^(warning|error):"   # 13 = 기존 baseline (신규 0)
+cargo clippy --workspace --all-targets 2>&1 | grep -cE "^(warning|error):"   # 1 = 기존 ai_repository 인자 수 warning
 ```
 
 ## ⚠️ 함정 / 주의 (재발 방지)
