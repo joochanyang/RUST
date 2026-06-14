@@ -3,14 +3,15 @@
 > 마지막 갱신: 2026-06-14 (4차 세션). 다음 세션에서 이 파일부터 읽고 "재개 지점"으로 이동.
 
 ## 현재 상태 (한 줄)
-머니 코렉트니스 6종 + 후속 #1·#2·#3 + reconcile + **latency-gate 버그 수정 완료**(4차 세션).
-**테스트 85 통과/0 실패, fmt clean, clippy 13(신규 0).** DB 통합테스트 0건 skip 확인.
-✅ **운영 차단 버그(latency gate) 해결**: 캔들 freshness를 `close_time` 기준으로 측정하도록 수정 → 정상 캔들 latency≈0, 진입 차단 해소. 커밋·푸시 완료(`0fee96f`).
+머니 코렉트니스 6종 + 후속 #1·#2·#3 + reconcile + **latency-gate 수정 + Bitget 8h 수정 완료**(4차 세션).
+**테스트 86 통과/0 실패, fmt clean, clippy 13(신규 0).** DB 통합테스트 0건 skip 확인.
+✅ **운영 차단 버그(latency gate) 해결 + 라이브 검증 완료**: close_time 기준 측정으로 정상 캔들 latency 0~128ms(수정전 7-20k). testnet 봇 23분 무중단 실행·Binance latency block 0건 확인. 주문 0건=과매도 아니라서 정상(RSI~55 횡보).
+✅ **Bitget 8h anomaly 해결 + 라이브 검증**: 구독 스냅샷 배치(500개, 오래된순)에서 `.next_back()`로 최신 행 선택 → Bitget latency 8h→0ms. 커밋 `0fee96f`(latency)·`d389631`(bitget) 푸시 완료.
 
 ## 위치 / 저장소
 - 작업 경로: `~/Documents/Rust/trading-system` (⚠️ git repo 루트는 **부모** `~/Documents/Rust`)
 - 원격: https://github.com/joochanyang/RUST.git (`main`, 추적됨)
-- 마지막 커밋: `0fee96f` "Fix latency gate blocking all entries by measuring candle freshness against close_time"
+- 마지막 커밋: `d389631` "Fix Bitget snapshot candle producing 8h-stale open_time"
 - 7-crate 워크스페이스: ai / api / core / exchange / execution / risk / strategy (~8,000 LOC)
 
 ## ✅ 이번까지 완료 (검증된 수정)
@@ -45,7 +46,7 @@
 - **함정 기록**: ⚠️**latency≠open_time 기준**(캔들은 close_time 기준이어야 정상틱이 fresh). 1m 캔들 경계틱도 open_time 기준이면 7-10초. 적대적 리뷰가 머니게이트에서 결정적(초기 진단 반증). DB 증거 우선(risk_events/candles/order_books). **타임아웃 트레이드오프**: 캔들 staleness 탐지창이 ~2s→~interval+2s(1m=62s)로 넓어짐(의도된 것, 실제 freeze 탐지는 오더북 경로+새 캔들 부재로)
 
 ## 🚀 다음 세션 첫 액션 (clear 후 여기부터)
-1. 위 "부팅 명령어" 복붙 → **85 passed / 0 failed · fmt clean · clippy 13** 확인(그린 베이스라인)
+1. 위 "부팅 명령어" 복붙 → **86 passed / 0 failed · fmt clean · clippy 13** 확인(그린 베이스라인)
 2. latency-gate 버그는 **해결됨**. 다음은 아래 "재개 지점"의 운영 재구동(testnet >21분 런 후 주문 발생 확인) 또는 선택 후속(Bitget 8h·position sweep)
 3. 트리거 문구: "rust 트레이딩 이어서 작업"
 
@@ -56,7 +57,7 @@
 
 ## ▶ 재개 지점 — "남은 후속" (우선순위 순)
 1. **🟡 운영 재구동 검증 (latency 수정 후)**: `cargo run -p trading-api --bin trading-api`로 testnet 재구동 → 로그에서 캔들 `latency_ms`가 ~0으로 떨어지는지 + **>21분 런** 후(TechnicalStrategy는 ≥21 캔들 워밍업 필요, 분당 1캔들) 실제 주문 발생하는지 확인. 주문 여전히 0이면 워밍업 부족/심볼필터 min-notional 스킵(testnet_runtime.rs:201-228)/AI 게이트 의심 — latency 잔여 버그 아님
-2. **🟠 Bitget 8시간 anomaly (조사→수정, 별개 커밋)**: `candles` DB 실측 = bitget `08:38/08:39` 고립행 **29,946,427ms(~8h19m)**. 가설=구독 스냅샷 배치에서 `bitget.rs` `parse_kline`이 `data.into_iter().next()`로 **가장 오래된 행** 선택(`action:"snapshot"` 미파싱). 1단계(동작보존): `BitgetKlineEnvelope`에 `#[serde(default)] action: String` + `tracing::warn!(rows, action, first_ts, last_ts)` 로깅 커밋. 2단계(운영): 재구동·재연결로 8h가 `action=="snapshot"`·`data.len()>>1`과 1:1 상관 확인. 3단계(확인 후, RED 테스트): 오래된순이면 `.next()`→최신행 선택. **⚠️ 정렬(asc/desc) 라이브 캡처로 확인 후 커밋**(latency-gate는 이미 8h를 차단하므로 긴급도 낮음 — 위험은 stale price 마크/시그널)
+2. ~~**🟠 Bitget 8시간 anomaly**~~ ✅ **해결(`d389631`)**: 라이브 캡처로 근본원인 확정 — Bitget v2 ws candle 구독 시 `action:"snapshot"`으로 **500개 과거 캔들을 오래된순(asc)** 전송, `parse_kline`이 `.next()`로 가장 오래된 행(499분 전) 선택 → open_time 8h 과거. **수정=`.next_back()`**(최신 행 선택, 단일 update는 동일). RED→GREEN + 라이브 검증(Bitget latency 8h→0ms, block 0건). 캡처 스크립트=`/tmp/bitget_capture.py`
 3. **(선택) 주기적 position sweep**: 캔들 루프에 주기적 `fetch_account_snapshot`로 실제 포지션 vs `open_position_keys` 대조(defense-in-depth). reconcile 리뷰 (b)안
 4. **(선택) signal.id 안정화**: `strategy/src/lib.rs:100` `Uuid::new_v4()` 캔들마다 새 id. (현재 무해 — open_position_keys가 1차 가드)
 5. **(선택) timeframe CI 가드**: 구독 채널 리터럴(1m)이 `timeframe_duration`에서 `Some` 반환하는지 검증하는 테스트. 비-1m 구독 추가 시 빌드 깨져 게이트 무음 회귀 방지(적대적 리뷰 제안, defer)
@@ -72,7 +73,7 @@ psql "$ADMIN_URL" -tAc "SELECT 1 FROM pg_database WHERE datname='trading_system_
   || psql "$ADMIN_URL" -c "CREATE DATABASE trading_system_test;"
 export TEST_DATABASE_URL="${DATABASE_URL%/*}/trading_system_test"
 
-# 2) 그린 베이스라인 확인 (반드시 85 passed / 0 failed 여야 함)
+# 2) 그린 베이스라인 확인 (반드시 86 passed / 0 failed 여야 함)
 cargo test --workspace 2>&1 | grep -oE "[0-9]+ passed" | awk '{s+=$1} END{print s" passed"}'
 cargo fmt --all -- --check && echo "fmt clean"
 cargo clippy --workspace --all-targets 2>&1 | grep -cE "^(warning|error):"   # 13 = 기존 baseline (신규 0)
