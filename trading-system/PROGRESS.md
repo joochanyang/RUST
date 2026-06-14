@@ -3,15 +3,16 @@
 > 마지막 갱신: 2026-06-14 (4차 세션). 다음 세션에서 이 파일부터 읽고 "재개 지점"으로 이동.
 
 ## 현재 상태 (한 줄)
-머니 코렉트니스 6종 + 후속 #1·#2·#3 + reconcile + **latency-gate 수정 + Bitget 8h 수정 완료**(4차 세션).
-**테스트 86 통과/0 실패, fmt clean, clippy 13(신규 0).** DB 통합테스트 0건 skip 확인.
-✅ **운영 차단 버그(latency gate) 해결 + 라이브 검증 완료**: close_time 기준 측정으로 정상 캔들 latency 0~128ms(수정전 7-20k). testnet 봇 23분 무중단 실행·Binance latency block 0건 확인. 주문 0건=과매도 아니라서 정상(RSI~55 횡보).
-✅ **Bitget 8h anomaly 해결 + 라이브 검증**: 구독 스냅샷 배치(500개, 오래된순)에서 `.next_back()`로 최신 행 선택 → Bitget latency 8h→0ms. 커밋 `0fee96f`(latency)·`d389631`(bitget) 푸시 완료.
+머니6종 + 후속 + reconcile + **latency-gate + Bitget 8h + 보호주문 Algo API 수정 완료**(4차 세션).
+**테스트 88 통과/0 실패, fmt clean, clippy 13(신규 0).** DB 통합테스트 0건 skip 확인.
+✅ **latency-gate 해결+라이브검증**: close_time 기준 측정 → 정상 캔들 0~128ms(수정전 7-20k). **실제 진입 주문 발생 확인**(11:58 ETHUSDT).
+✅ **Bitget 8h 해결+라이브검증**: 스냅샷 배치(500개 오래된순)에서 `.next_back()` 최신행 → 8h→0ms.
+✅ **보호주문(SL/TP) -4120 해결+testnet 200 검증**: Binance가 2025-12-09부로 조건부주문을 Algo Service 이전. `STOP_MARKET`/`TAKE_PROFIT_MARKET`을 `/fapi/v1/order`→**`/fapi/v1/algoOrder`**(`algoType=CONDITIONAL`, `stopPrice`→`triggerPrice`)로 변경. testnet 양쪽 HTTP 200·algoStatus:NEW. 커밋 `0fee96f`·`d389631`·`659f50e` 푸시 완료.
 
 ## 위치 / 저장소
 - 작업 경로: `~/Documents/Rust/trading-system` (⚠️ git repo 루트는 **부모** `~/Documents/Rust`)
 - 원격: https://github.com/joochanyang/RUST.git (`main`, 추적됨)
-- 마지막 커밋: `d389631` "Fix Bitget snapshot candle producing 8h-stale open_time"
+- 마지막 커밋: `659f50e` "Route protection orders through the Algo Order API (fixes -4120)"
 - 7-crate 워크스페이스: ai / api / core / exchange / execution / risk / strategy (~8,000 LOC)
 
 ## ✅ 이번까지 완료 (검증된 수정)
@@ -46,7 +47,7 @@
 - **함정 기록**: ⚠️**latency≠open_time 기준**(캔들은 close_time 기준이어야 정상틱이 fresh). 1m 캔들 경계틱도 open_time 기준이면 7-10초. 적대적 리뷰가 머니게이트에서 결정적(초기 진단 반증). DB 증거 우선(risk_events/candles/order_books). **타임아웃 트레이드오프**: 캔들 staleness 탐지창이 ~2s→~interval+2s(1m=62s)로 넓어짐(의도된 것, 실제 freeze 탐지는 오더북 경로+새 캔들 부재로)
 
 ## 🚀 다음 세션 첫 액션 (clear 후 여기부터)
-1. 위 "부팅 명령어" 복붙 → **86 passed / 0 failed · fmt clean · clippy 13** 확인(그린 베이스라인)
+1. 위 "부팅 명령어" 복붙 → **88 passed / 0 failed · fmt clean · clippy 13** 확인(그린 베이스라인)
 2. latency-gate 버그는 **해결됨**. 다음은 아래 "재개 지점"의 운영 재구동(testnet >21분 런 후 주문 발생 확인) 또는 선택 후속(Bitget 8h·position sweep)
 3. 트리거 문구: "rust 트레이딩 이어서 작업"
 
@@ -56,7 +57,7 @@
 - 부팅 검증: `cargo run -p trading-api --bin trading-api` → settings 게이트 통과·API listening·시장스트림 수신 OK
 
 ## ▶ 재개 지점 — "남은 후속" (우선순위 순)
-1. **🟡 운영 재구동 검증 (latency 수정 후)**: `cargo run -p trading-api --bin trading-api`로 testnet 재구동 → 로그에서 캔들 `latency_ms`가 ~0으로 떨어지는지 + **>21분 런** 후(TechnicalStrategy는 ≥21 캔들 워밍업 필요, 분당 1캔들) 실제 주문 발생하는지 확인. 주문 여전히 0이면 워밍업 부족/심볼필터 min-notional 스킵(testnet_runtime.rs:201-228)/AI 게이트 의심 — latency 잔여 버그 아님
+1. **🟡 보호주문 e2e 라이브 확인 (선택)**: 보호주문 수정(`659f50e`)은 testnet에 직접 쏴서 200 검증 완료. 단 **실제 봇이 진입→보호주문까지 가는 전체 경로**는 시장이 과매도(RSI≤30)가 될 때 자연 발생. 봇 띄워두고 진입 시 보호주문 성공(LOCK 안 걸림)·실제 SL/TP 등록되는지 확인하면 100% 종결. (이미 11:58에 진입은 발생했고, 그땐 옛 코드라 -4120 LOCK. 새 코드론 통과 예상)
 2. ~~**🟠 Bitget 8시간 anomaly**~~ ✅ **해결(`d389631`)**: 라이브 캡처로 근본원인 확정 — Bitget v2 ws candle 구독 시 `action:"snapshot"`으로 **500개 과거 캔들을 오래된순(asc)** 전송, `parse_kline`이 `.next()`로 가장 오래된 행(499분 전) 선택 → open_time 8h 과거. **수정=`.next_back()`**(최신 행 선택, 단일 update는 동일). RED→GREEN + 라이브 검증(Bitget latency 8h→0ms, block 0건). 캡처 스크립트=`/tmp/bitget_capture.py`
 3. **(선택) 주기적 position sweep**: 캔들 루프에 주기적 `fetch_account_snapshot`로 실제 포지션 vs `open_position_keys` 대조(defense-in-depth). reconcile 리뷰 (b)안
 4. **(선택) signal.id 안정화**: `strategy/src/lib.rs:100` `Uuid::new_v4()` 캔들마다 새 id. (현재 무해 — open_position_keys가 1차 가드)
@@ -73,7 +74,7 @@ psql "$ADMIN_URL" -tAc "SELECT 1 FROM pg_database WHERE datname='trading_system_
   || psql "$ADMIN_URL" -c "CREATE DATABASE trading_system_test;"
 export TEST_DATABASE_URL="${DATABASE_URL%/*}/trading_system_test"
 
-# 2) 그린 베이스라인 확인 (반드시 86 passed / 0 failed 여야 함)
+# 2) 그린 베이스라인 확인 (반드시 88 passed / 0 failed 여야 함)
 cargo test --workspace 2>&1 | grep -oE "[0-9]+ passed" | awk '{s+=$1} END{print s" passed"}'
 cargo fmt --all -- --check && echo "fmt clean"
 cargo clippy --workspace --all-targets 2>&1 | grep -cE "^(warning|error):"   # 13 = 기존 baseline (신규 0)
@@ -91,6 +92,8 @@ cargo clippy --workspace --all-targets 2>&1 | grep -cE "^(warning|error):"   # 1
 - **reconcile는 단일 조회 신뢰 금지**: 타임아웃 직후 1회 조회는 stale일 수 있음(체결됐는데 None/NEW). 반드시 `query_order_until_settled`로 재시도(미체결/없음만, Err은 즉시 surface). 미체결 결론은 재시도 소진 후에만
 - 보호실패/타임아웃 복구·보호배치는 인라인 금지 → `handle_protection_failure`·`handle_entry_timeout`·`finalize_entry_with_protection`·`reconcile_entry_timeout` 함수로(테스트 가능 seam)
 - **캔들 latency는 close_time 기준**(절대 open_time 아님): 1분봉 open_time=봉 시작이라 정상 틱도 7-10초로 읽혀 게이트가 모든 진입 차단. `MarketEvent::event_time()` Candle arm=`candle.close_time()`(=open_time+interval). 오더북은 진짜 event_time(불변). `timeframe_duration`은 대소문자 무시(Bitget `1H`)+미인식은 open_time 폴백(fail-safe). 머니게이트 진단은 **DB 실측 우선**(candles/order_books로 클럭스큐 배제)+적대적 리뷰 필수(초기 진단이 틀릴 수 있음)
+- **Bitget 구독 스냅샷=500개 과거캔들 오래된순(asc)** → 캔들파서는 `.next_back()`(최신행). `.next()`면 8h 과거 open_time
+- **보호주문(SL/TP)은 Algo API**: Binance가 2025-12-09부로 조건부주문(STOP_MARKET/TAKE_PROFIT_MARKET/STOP/TAKE_PROFIT/TRAILING_STOP_MARKET)을 Algo Service 이전. `/fapi/v1/order`로 보내면 **-4120 거부**. 반드시 `/fapi/v1/algoOrder` + `algoType=CONDITIONAL` + `triggerPrice`(stopPrice 아님). `order_id_from_value`는 이미 `algoId` 폴백 있음. testnet 검증=`/tmp/verify_protection_codepath.py`. 거래소 API 에러는 **공식 문서+실제 testnet 재현** 두 증거로 진단(추측 금지)
 - 서브에이전트는 항상 `model: "opus"`
 
 ## 📚 핵심 문서
