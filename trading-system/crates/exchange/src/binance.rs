@@ -31,6 +31,14 @@ pub struct BinanceAdapter {
 /// account call can block the strategy loop before surfacing an error.
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum gap between market-data frames before the WebSocket is treated as
+/// stalled and reconnected. Binance pushes bookTicker/kline updates for active
+/// symbols far more often than this and sends a ping at least every few minutes,
+/// so a silent gap this long means the connection has half-opened. Without this
+/// bound a silent stall hangs `read.next()` forever and the strategy freezes on
+/// stale data (the latency gate then blocks all entries).
+const MARKET_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Builds the REST client used for all signed/unsigned Binance calls with a
 /// bounded request timeout. A request must never hang the strategy loop
 /// indefinitely; falling back to `Client::new()` (no timeout) is unsafe here.
@@ -768,7 +776,8 @@ async fn run_public_market_stream_with_reconnect(
             return Ok(());
         }
 
-        match run_public_market_stream_once(&url, sender.clone()).await {
+        match run_public_market_stream_once(&url, sender.clone(), MARKET_STREAM_IDLE_TIMEOUT).await
+        {
             Ok(()) => {
                 backoff = Duration::from_secs(1);
             }
@@ -789,37 +798,48 @@ async fn run_public_market_stream_with_reconnect(
 async fn run_public_market_stream_once(
     url: &str,
     sender: mpsc::Sender<Result<trading_core::ObservedMarketEvent>>,
+    idle_timeout: Duration,
 ) -> Result<()> {
     let (stream, _) = connect_async(url).await.map_err(|error| {
         TradingError::Exchange(format!("Binance WebSocket connect failed: {error}"))
     })?;
     let (_, mut read) = stream.split();
 
-    while let Some(message) = read.next().await {
+    loop {
+        // A silent connection (no data, no ping, no close) must not hang the loop
+        // forever: time the read out so the reconnect loop can re-establish it.
+        let message = match tokio::time::timeout(idle_timeout, read.next()).await {
+            Ok(Some(message)) => message,
+            // Stream ended cleanly.
+            Ok(None) => return Ok(()),
+            // No frame within the idle window: treat as a stalled connection and
+            // surface an error so the caller reconnects.
+            Err(_elapsed) => {
+                return Err(TradingError::Exchange(format!(
+                    "Binance WebSocket stalled: no frame within {idle_timeout:?}"
+                )));
+            }
+        };
+
         match message {
             Ok(Message::Text(text)) => {
                 let event = parse_market_payload(text.as_ref())?;
                 let observed = trading_core::ObservedMarketEvent::new(event, Utc::now());
                 if sender.send(Ok(observed)).await.is_err() {
-                    break;
+                    return Ok(());
                 }
             }
-            Ok(Message::Close(_)) => break,
+            Ok(Message::Close(_)) => return Ok(()),
             Ok(_) => {}
+            // A read error means the connection is broken; return so the reconnect
+            // loop re-establishes it instead of spinning on a dead socket.
             Err(error) => {
-                let send_result = sender
-                    .send(Err(TradingError::Exchange(format!(
-                        "Binance WebSocket read failed: {error}"
-                    ))))
-                    .await;
-                if send_result.is_err() {
-                    break;
-                }
+                return Err(TradingError::Exchange(format!(
+                    "Binance WebSocket read failed: {error}"
+                )));
             }
         }
     }
-
-    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1344,6 +1364,47 @@ mod tests {
         assert!(
             matches!(map_request_error(error), TradingError::Timeout(_)),
             "a timeout must map to TradingError::Timeout"
+        );
+    }
+
+    // A market-data WebSocket that connects but then goes silent (no data, no
+    // ping, no close frame) must not hang the read loop forever. Without an idle
+    // read timeout, run_public_market_stream_once blocks on read.next() and the
+    // reconnect loop never fires, so the strategy freezes on stale data. We point
+    // the loop at a local WS server that accepts and then stays silent, and
+    // require the single connection attempt to return an error within the bound.
+    #[tokio::test]
+    async fn market_stream_times_out_on_silent_websocket() {
+        use std::time::Instant;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept the WS handshake, then hold the connection open without sending.
+        tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                if let Ok(ws) = tokio_tungstenite::accept_async(socket).await {
+                    // Keep the stream alive but never send a frame.
+                    let _ws = ws;
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                }
+            }
+        });
+
+        let (sender, _receiver) = mpsc::channel(8);
+        let idle_timeout = Duration::from_millis(500);
+        let start = Instant::now();
+        let result =
+            run_public_market_stream_once(&format!("ws://{addr}/"), sender, idle_timeout).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a silent websocket must produce an error, not hang"
+        );
+        assert!(
+            elapsed < idle_timeout + Duration::from_secs(2),
+            "the read loop should time out near the idle bound, took {elapsed:?}"
         );
     }
 }

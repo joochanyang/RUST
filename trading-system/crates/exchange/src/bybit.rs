@@ -14,6 +14,12 @@ use crate::{
     ProtectionAck, ProtectionOrderRequest,
 };
 
+/// Maximum gap between market-data frames before the WebSocket is treated as
+/// stalled and reconnected. A silent gap this long means the connection has
+/// half-opened; without this bound `read.next()` hangs forever and the strategy
+/// freezes on stale data.
+const MARKET_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct BybitAdapter {
     pub ws_base_url: String,
     pub rest_base_url: String,
@@ -106,7 +112,14 @@ async fn run_public_market_stream_with_reconnect(
             return Ok(());
         }
 
-        match run_public_market_stream_once(&url, &topics, sender.clone()).await {
+        match run_public_market_stream_once(
+            &url,
+            &topics,
+            sender.clone(),
+            MARKET_STREAM_IDLE_TIMEOUT,
+        )
+        .await
+        {
             Ok(()) => {
                 backoff = Duration::from_secs(1);
             }
@@ -128,6 +141,7 @@ async fn run_public_market_stream_once(
     url: &str,
     topics: &[String],
     sender: mpsc::Sender<Result<trading_core::ObservedMarketEvent>>,
+    idle_timeout: Duration,
 ) -> Result<()> {
     let (stream, _) = connect_async(url).await.map_err(|error| {
         TradingError::Exchange(format!("Bybit WebSocket connect failed: {error}"))
@@ -140,7 +154,19 @@ async fn run_public_market_stream_once(
         .map_err(|error| TradingError::Exchange(format!("Bybit subscribe failed: {error}")))?;
     let mut ticker_state = HashMap::new();
 
-    while let Some(message) = read.next().await {
+    loop {
+        // A silent connection must not hang the loop forever: time the read out so
+        // the reconnect loop can re-establish it.
+        let message = match tokio::time::timeout(idle_timeout, read.next()).await {
+            Ok(Some(message)) => message,
+            Ok(None) => return Ok(()),
+            Err(_elapsed) => {
+                return Err(TradingError::Exchange(format!(
+                    "Bybit WebSocket stalled: no frame within {idle_timeout:?}"
+                )));
+            }
+        };
+
         match message {
             Ok(Message::Text(text)) => {
                 if !is_market_payload(text.as_ref()) {
@@ -149,25 +175,20 @@ async fn run_public_market_stream_once(
                 let event = parse_market_payload_with_state(text.as_ref(), &mut ticker_state)?;
                 let observed = trading_core::ObservedMarketEvent::new(event, Utc::now());
                 if sender.send(Ok(observed)).await.is_err() {
-                    break;
+                    return Ok(());
                 }
             }
-            Ok(Message::Close(_)) => break,
+            Ok(Message::Close(_)) => return Ok(()),
             Ok(_) => {}
+            // A read error means the connection is broken; return so the reconnect
+            // loop re-establishes it instead of spinning on a dead socket.
             Err(error) => {
-                let send_result = sender
-                    .send(Err(TradingError::Exchange(format!(
-                        "Bybit WebSocket read failed: {error}"
-                    ))))
-                    .await;
-                if send_result.is_err() {
-                    break;
-                }
+                return Err(TradingError::Exchange(format!(
+                    "Bybit WebSocket read failed: {error}"
+                )));
             }
         }
     }
-
-    Ok(())
 }
 
 fn is_market_payload(payload: &str) -> bool {
