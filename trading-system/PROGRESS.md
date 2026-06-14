@@ -48,8 +48,10 @@
 
 ## 🚀 다음 세션 첫 액션 (clear 후 여기부터)
 1. 위 "부팅 명령어" 복붙 → **88 passed / 0 failed · fmt clean · clippy 13** 확인(그린 베이스라인)
-2. latency-gate 버그는 **해결됨**. 다음은 아래 "재개 지점"의 운영 재구동(testnet >21분 런 후 주문 발생 확인) 또는 선택 후속(Bitget 8h·position sweep)
-3. 트리거 문구: "rust 트레이딩 이어서 작업"
+2. **세 버그 모두 해결·검증됨**(latency-gate / Bitget 8h / 보호주문 Algo). git `main` = `f936ab9` 동기화 완료.
+3. **⚙️ testnet 봇은 직전 세션 종료 시 kill 완료**(실행 중 아님). 다시 띄우려면 "재개 지점" 위의 봇 실행 명령 또는 `set -a; source .env; set +a && RUST_LOG=trading_api=debug,info cargo run -p trading-api --bin trading-api`. 검증 로그는 `/tmp/trading-bot-run3.log`(latency 0~128ms 확인 가능, 참고용).
+4. **다음 할 일(선택)**: 아래 "재개 지점"의 ①보호주문 e2e 라이브(진입→보호 전체경로, 시장 과매도 시 자연발생) ②position sweep ③signal.id 안정화 ④timeframe CI 가드. **급한 버그 없음** — 추가 작업 안 하면 현 상태로 종결 가능.
+5. 트리거 문구: "rust 트레이딩 이어서 작업"
 
 ## ✅ 운영 확인 완료 (2026-06-14, 사용자 키로 검증)
 - **`demo-fapi.binance.com` = 진짜 testnet 확정**: 사용자 testnet 키로 signed `GET /fapi/v3/account` → HTTP 200 + **testnet 가짜잔고**(USDT 5282·USDC 5000·BTC 0.01). 같은 키를 실거래 `fapi.binance.com`에 치면 **HTTP 401 `-2015`**(거부) → testnet 전용 확정, 실거래 자금 위험 없음
