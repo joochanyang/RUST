@@ -1,10 +1,12 @@
 # PROGRESS — trading-system (Rust 코인선물 AI 트레이딩)
 
-> 마지막 갱신: 2026-06-15 (출시 전 감사 P0/P1 정식 커밋 + flaky 테스트 병렬안전화 + runbook 정합성 수정). 다음 세션에서 이 파일부터 읽고 "재개 지점"으로 이동.
+> 마지막 갱신: 2026-06-15 (★보호주문 e2e 라이브 검증 종결 + WS silent-stall 재연결 수정). 다음 세션에서 이 파일부터 읽고 "재개 지점"으로 이동.
 
 ## 현재 상태 (한 줄)
-머니6종 + 후속 + reconcile + **latency-gate + Bitget 8h + 보호주문 Algo API + 출시 전 감사 P0/P1 + runbook 정합성 수정 완료**.
-**전체 테스트 98 통과/0 실패 (병렬 `cargo test` 반복 실행 green — flaky 해소됨), fmt clean, clippy warning 1(기존 ai_repository 인자 수).** ⚠️**DB 통합테스트는 `TEST_DATABASE_URL` 필요**(미설정 시 skip). 로컬 검증용 DB=`trading_system_test`(로컬 PG).
+머니6종 + 후속 + reconcile + **latency-gate + Bitget 8h + 보호주문 Algo API(+e2e 라이브 종결) + 출시 전 감사 P0/P1 + runbook 정합성 + WS silent-stall 재연결 완료**.
+**전체 테스트 99 통과/0 실패 (병렬 `cargo test` 반복 green — flaky 해소됨), fmt clean, clippy warning 1(기존 ai_repository 인자 수).** ⚠️**DB 통합테스트는 `TEST_DATABASE_URL` 필요**(미설정 시 skip). 로컬 검증용 DB=`trading_system_test`(로컬 PG).
+✅ **보호주문 e2e 라이브 종결 (2026-06-15 01:46)**: 봇 상주 중 ETHUSDT 자연 진입(RSI≈12) → 보호주문 LOCK 없이 통과·SL/TP algoOrder 거래소 등록(algoStatus:NEW) 확정. 상세는 "재개 지점" §1.
+✅ **WS silent-stall 재연결 (`077ee9e`)**: 3거래소 WS read 루프에 idle 30s 타임아웃+read에러 시 reconnect. e2e 모니터링 중 Binance freeze 발견→수정. 상세는 "재개 지점" §1 하위.
 ✅ **출시 전 감사 P0/P1 정식 커밋 (2026-06-15, `297a9dd`)**: 이전 세션이 작업만 하고 커밋 안 했던 ~958 LOC(WS 라우팅·보호주문 partial 보상·testnet 영속화/재시작복구·testnet 리스크상태 DB화·인증 하드닝·운영가드·URL시크릿 로그차단)을 독립 검증(single-thread green·fmt·clippy·dashboard tsc) 후 커밋. `dashboard/*.tsbuildinfo` gitignore 추가.
 ✅ **flaky 테스트 병렬안전화 (2026-06-15, `2e01f63`)**: `account_risk_state` 2개 테스트가 `load_account_risk_state`의 **계정 전역집계**를 단언 → 공유 DB 동시 변경으로 realized PnL 테스트가 병렬에서 flaky(-980/-990 등). **프로덕션 코드는 정상**(전역집계가 의도). 테스트를 **row-scoped**(자기 포지션의 unrealized_pnl / 자기 포지션 realized 기여를 프로덕션 SQL식으로 직접 계산)로 재작성. 병렬 `cargo test` 반복 green 확인.
 ✅ **runbook 정합성 수정 (2026-06-15, `57b52f2`)**: ①`paper_trading_14d` 게이트(라이브 해제용 머니게이트)가 runbook.md:96 명세("paper-mode" positions/protection)와 달리 `positions`/`protection_orders`를 **mode 필터 없이** 카운트 → **testnet 데이터만으로 라이브 게이트 통과 가능 결함**. `calculate_paper_trading_evidence`(`live_readiness.rs`)에 `paper_protection`/`paper_positions` CTE 추가(=`protection_orders.entry_order_id → orders.mode='paper'` 조인)로 스코핑. positions 테이블엔 mode 컬럼 없음→orders로만 추적. ②reconcile 해피패스 테스트(`testnet_runtime.rs`)가 `signal_id=nil`을 signals seed 없이 넘겨 FK위반→spurious LOCK → `run_reconcile`에 nil signal seed 추가(프로덕션은 signal 먼저 영속화하므로 정합). DB 통합테스트 3개 추가/수정, 실 PostgreSQL로 검증.
@@ -73,7 +75,8 @@
 - **검증 완료**: `cargo test --workspace` 통과(총 96 passed), `cargo clippy --workspace --all-targets` exit 0(잔여 warning 1개: 기존 `ai_repository::persist_ai_decision` 인자 수), `npm run lint` 통과, `npx tsc --noEmit` 통과, `npm run build` 통과.
 
 ## ▶ 재개 지점 — "남은 후속" (우선순위 순)
-1. **🟡 보호주문 e2e 라이브 확인 (선택)**: 보호주문 수정(`659f50e`)은 testnet에 직접 쏴서 200 검증 완료. 단 **실제 봇이 진입→보호주문까지 가는 전체 경로**는 시장이 과매도(RSI≤30)가 될 때 자연 발생. 봇 띄워두고 진입 시 보호주문 성공(LOCK 안 걸림)·실제 SL/TP 등록되는지 확인하면 100% 종결. (이미 11:58에 진입은 발생했고, 그땐 옛 코드라 -4120 LOCK. 새 코드론 통과 예상)
+1. ~~**🟡 보호주문 e2e 라이브 확인**~~ ✅ **종결 (2026-06-15 01:46, 라이브 검증 완료)**: 봇 상주 중 ETHUSDT RSI 과매도(≈12) 자연 진입 발생 → **보호주문 전체 경로 성공**. risk_event(severity=**info**, action=order_submitted): `order_status:FILLED`·`protection_ok:true`·`stop_loss_order_id`/`take_profit_order_id` 발급. testnet 거래소 직접 확인: openAlgoOrders에 SL/TP 양쪽 `algoStatus:NEW`(TP triggerPrice 1698.1, clientAlgoId `...-sl`/`-tp`), positionRisk ETHUSDT amt 0.030 @1665.64. **-4120 LOCK 재발 없음** — 새 Algo API(`659f50e`) 라이브 확정. ⚠️**이 진입 직전 WS freeze 결함 발견·수정**(아래 신규).
+- ✅ **신규 수정: WS silent-stall 재연결 (`077ee9e`)**: e2e 모니터링 중 Binance 시장스트림이 16:06경 **에러 없이 freeze**(half-open, read.next() 영구 hang) → 재연결 안 됨 → latency-gate가 진입 690건 차단(봇 진입불가). 3거래소(binance/bitget/bybit) WS read 루프에 `MARKET_STREAM_IDLE_TIMEOUT=30s`(stall 시 reconnect) + read 에러 시 return 추가. silent-WS 통합테스트. 봇 재시작 후 freeze 재발 0·Bitget 끊김→자동복구 확인. **latency-gate는 정상 작동했음**(stale 데이터 거래 차단=제 역할).
 2. ~~**🟠 Bitget 8시간 anomaly**~~ ✅ **해결(`d389631`)**: 라이브 캡처로 근본원인 확정 — Bitget v2 ws candle 구독 시 `action:"snapshot"`으로 **500개 과거 캔들을 오래된순(asc)** 전송, `parse_kline`이 `.next()`로 가장 오래된 행(499분 전) 선택 → open_time 8h 과거. **수정=`.next_back()`**(최신 행 선택, 단일 update는 동일). RED→GREEN + 라이브 검증(Bitget latency 8h→0ms, block 0건). 캡처 스크립트=`/tmp/bitget_capture.py`
 3. **(선택) 주기적 position sweep**: 캔들 루프에 주기적 `fetch_account_snapshot`로 실제 포지션 vs `open_position_keys` 대조(defense-in-depth). reconcile 리뷰 (b)안
 4. **(선택) signal.id 안정화**: `strategy/src/lib.rs:100` `Uuid::new_v4()` 캔들마다 새 id. (현재 무해 — open_position_keys가 1차 가드)
