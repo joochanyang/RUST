@@ -3,9 +3,9 @@
 > 마지막 갱신: 2026-06-14 (3차 세션). 다음 세션에서 이 파일부터 읽고 "재개 지점"으로 이동.
 
 ## 현재 상태 (한 줄)
-머니 코렉트니스 6종(C1~H3) + 후속 #1·#2·#3 + **타임아웃 자동복구 reconcile(+재시도 하드닝)** 완료.
+머니 코렉트니스 6종 + 후속 #1·#2·#3 + reconcile 완료. **운영확인(demo-fapi host 검증) 통과 + testnet 모드 ON**.
 **테스트 78 통과/0 실패, fmt clean, clippy 13(신규 0).** DB 통합테스트 0건 skip 확인.
-다음은 아래 "남은 후속" 참조(운영확인 + 선택적 position sweep).
+🔴 **운영 차단 버그 발견**: latency gate가 모든 진입 차단 → 주문 0건(아래 "재개 지점 #1" 참조). 다음 작업 1순위.
 
 ## 위치 / 저장소
 - 작업 경로: `~/Documents/Rust/trading-system` (⚠️ git repo 루트는 **부모** `~/Documents/Rust`)
@@ -38,13 +38,18 @@
 
 ## 🚀 다음 세션 첫 액션 (clear 후 여기부터)
 1. 위 "부팅 명령어" 복붙 → **78 passed / 0 failed · fmt clean · clippy 13** 확인(그린 베이스라인)
-2. 그다음 아래 "재개 지점"을 **우선순위 순**으로. 단, **#1은 사용자 입회 필요**(testnet 키) — 코드 작업은 #2가 첫 후보
+2. 그다음 아래 "재개 지점 #1"(latency gate 버그) — **코드 작업 최우선**, Claude 단독 진행 가능
 3. 트리거 문구: "rust 트레이딩 이어서 작업"
 
+## ✅ 운영 확인 완료 (2026-06-14, 사용자 키로 검증)
+- **`demo-fapi.binance.com` = 진짜 testnet 확정**: 사용자 testnet 키로 signed `GET /fapi/v3/account` → HTTP 200 + **testnet 가짜잔고**(USDT 5282·USDC 5000·BTC 0.01). 같은 키를 실거래 `fapi.binance.com`에 치면 **HTTP 401 `-2015`**(거부) → testnet 전용 확정, 실거래 자금 위험 없음
+- **testnet 모드 ON**: `.env`(gitignore, 커밋 안 됨) → `BINANCE_TESTNET_API_KEY/SECRET`(각 64자) 설정 + `BINANCE_TESTNET_ENABLED=true` + `TRADING_MODE=testnet` + `MARKET_DATA_ENABLED=true`(testnet 게이트 필수). `BINANCE_TESTNET_MAX_ORDER_NOTIONAL=50`(주문당 상한). ⚠️채팅으로 평문 전송된 키라 rotate 권장
+- 부팅 검증: `cargo run -p trading-api --bin trading-api` → settings 게이트 통과·API listening·시장스트림 수신 OK
+
 ## ▶ 재개 지점 — "남은 후속" (우선순위 순)
-1. **⚠️사용자 입회 필요 / 운영 확인(코드 아님)**: `demo-fapi.binance.com`이 실제 데모/테스트넷인지 testnet 키와 함께 1회 확인 (안전모델 전체가 이 host 문자열에 의존). → Claude 단독 진행 불가, 사용자가 키·확인 제공해야 함
-2. **(코드, 다음 작업 1순위) 주기적 position sweep**: 캔들 루프에 주기적 `fetch_account_snapshot`로 실제 포지션 vs `open_position_keys` 대조 → 모든 경로의 무방비 포지션 사후 감지(defense-in-depth). reconcile 리뷰에서 제안된 (b)안, 별도 기능. TDD + 적대적 리뷰로 진행
-3. **(선택) signal.id 안정화**: `strategy/src/lib.rs:100` `Uuid::new_v4()`가 캔들마다 새 id → 같은 시장조건 재진입은 다른 멱등키. (현재 무해 — open_position_keys가 1차 가드)
+1. **🔴 운영 차단 버그 / latency gate (코드 최우선)**: 캔들 latency를 `received_at − candle.open_time`(types.rs:194-219)으로 재는데 **1분봉 open_time = 봉 시작시각**이라 항상 수~수십초. threshold=**2,000ms**(risk_event_repository.rs:6 `MARKET_DATA_LATENCY_THRESHOLD_MS` + risk/lib.rs:123 하드코딩 `2_000` **2곳**)라 risk gate가 모든 진입 차단 → **testnet 주문 0건**. + **Bitget은 latency 8시간(29946421ms)=별도 심각 버그**(시각파싱/과거봉 추정). 캔들엔 open_time 기준 latency 부적절 → 마감(close)기준 or 캔들 latency gate 면제 검토. TDD+적대적 리뷰
+2. **(선택) 주기적 position sweep**: 캔들 루프에 주기적 `fetch_account_snapshot`로 실제 포지션 vs `open_position_keys` 대조(defense-in-depth). reconcile 리뷰 (b)안
+3. **(선택) signal.id 안정화**: `strategy/src/lib.rs:100` `Uuid::new_v4()` 캔들마다 새 id. (현재 무해 — open_position_keys가 1차 가드)
 
 ## 🔧 다음 세션 부팅 명령어 (그대로 복붙)
 ```sh
