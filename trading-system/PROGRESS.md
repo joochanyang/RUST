@@ -36,9 +36,14 @@
   - 기각된 7건 요지: status-string 취약성(애매=LOCK=안전방향), -2013 오분류(체결+미존재 모순), 시장주문 NEW-resting(시장주문은 동기체결), 재시작 영속성(기존 한계·범위밖), Skipped audit 누락(관측성·머니무관)
 - 테스트: reconcile 4분기 e2e + 재시도 3종. RecordingAdapter에 `QueryOrderBehavior`(Filled/ExistsNotFilled/NotFound/QueryFails/NotFilledForFirst) + `query_calls` 카운터
 
-## ▶ 재개 지점 — "남은 후속" (우선순위 순, 이번 범위 밖)
-1. **운영 확인(코드 아님)**: `demo-fapi.binance.com`이 실제 데모/테스트넷인지 testnet 키와 함께 1회 확인 (안전모델 전체가 이 host 문자열에 의존)
-2. **(선택) 주기적 position sweep**: 캔들 루프에 주기적 `fetch_account_snapshot`로 실제 포지션 vs `open_position_keys` 대조 → 모든 경로의 무방비 포지션 사후 감지(defense-in-depth). reconcile 리뷰에서 제안된 (b)안, 별도 기능
+## 🚀 다음 세션 첫 액션 (clear 후 여기부터)
+1. 위 "부팅 명령어" 복붙 → **78 passed / 0 failed · fmt clean · clippy 13** 확인(그린 베이스라인)
+2. 그다음 아래 "재개 지점"을 **우선순위 순**으로. 단, **#1은 사용자 입회 필요**(testnet 키) — 코드 작업은 #2가 첫 후보
+3. 트리거 문구: "rust 트레이딩 이어서 작업"
+
+## ▶ 재개 지점 — "남은 후속" (우선순위 순)
+1. **⚠️사용자 입회 필요 / 운영 확인(코드 아님)**: `demo-fapi.binance.com`이 실제 데모/테스트넷인지 testnet 키와 함께 1회 확인 (안전모델 전체가 이 host 문자열에 의존). → Claude 단독 진행 불가, 사용자가 키·확인 제공해야 함
+2. **(코드, 다음 작업 1순위) 주기적 position sweep**: 캔들 루프에 주기적 `fetch_account_snapshot`로 실제 포지션 vs `open_position_keys` 대조 → 모든 경로의 무방비 포지션 사후 감지(defense-in-depth). reconcile 리뷰에서 제안된 (b)안, 별도 기능. TDD + 적대적 리뷰로 진행
 3. **(선택) signal.id 안정화**: `strategy/src/lib.rs:100` `Uuid::new_v4()`가 캔들마다 새 id → 같은 시장조건 재진입은 다른 멱등키. (현재 무해 — open_position_keys가 1차 가드)
 
 ## 🔧 다음 세션 부팅 명령어 (그대로 복붙)
