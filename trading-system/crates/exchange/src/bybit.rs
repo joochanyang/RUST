@@ -82,6 +82,16 @@ impl ExchangeAdapter for BybitAdapter {
             "Bybit cancel order is not implemented yet".to_owned(),
         ))
     }
+
+    async fn query_order(
+        &self,
+        _symbol: &Symbol,
+        _client_order_id: &str,
+    ) -> Result<Option<OrderAck>> {
+        Err(TradingError::Exchange(
+            "Bybit order query is not implemented yet".to_owned(),
+        ))
+    }
 }
 
 async fn run_public_market_stream_with_reconnect(

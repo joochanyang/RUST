@@ -149,6 +149,23 @@ impl ExchangeAdapter for BinanceAdapter {
             "Binance cancel order is not implemented yet".to_owned(),
         ))
     }
+
+    async fn query_order(
+        &self,
+        symbol: &Symbol,
+        client_order_id: &str,
+    ) -> Result<Option<OrderAck>> {
+        let response = self
+            .get_signed(
+                "/fapi/v1/order",
+                vec![
+                    ("symbol", symbol.as_str().to_owned()),
+                    ("origClientOrderId", client_order_id.to_owned()),
+                ],
+            )
+            .await;
+        query_order_result(response)
+    }
 }
 
 impl BinanceAdapter {
@@ -273,6 +290,41 @@ async fn decode_binance_response(response: reqwest::Response) -> Result<Value> {
     }
 
     serde_json::from_str(&body).map_err(|error| TradingError::Exchange(error.to_string()))
+}
+
+/// Binance error code for a query against an order that does not exist.
+const ORDER_NOT_FOUND_CODE: i64 = -2013;
+
+/// Classifies the result of a `GET /fapi/v1/order` lookup into:
+/// - `Ok(Some(ack))` — the order exists (caller inspects `ack.status`),
+/// - `Ok(None)` — the order does not exist on the exchange (code -2013),
+/// - `Err(_)` — the query itself failed, so the order's existence is UNKNOWN.
+///
+/// Separating "does not exist" from "query failed" is the whole point: only the
+/// former is safe to treat as "no position".
+fn query_order_result(response: Result<Value>) -> Result<Option<OrderAck>> {
+    match response {
+        Ok(raw) => order_ack_from_value(raw).map(Some),
+        Err(error) if is_order_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Detects Binance's "Order does not exist" (-2013) response embedded in a failed
+/// request's error message body.
+fn is_order_not_found(error: &TradingError) -> bool {
+    let TradingError::Exchange(message) = error else {
+        return false;
+    };
+    // The error message contains the raw JSON body, e.g.
+    // `{"code":-2013,"msg":"Order does not exist."}`. Find and parse it.
+    let Some(start) = message.find('{') else {
+        return false;
+    };
+    serde_json::from_str::<Value>(&message[start..])
+        .ok()
+        .and_then(|body| body.get("code").and_then(Value::as_i64))
+        == Some(ORDER_NOT_FOUND_CODE)
 }
 
 fn order_ack_from_value(raw: Value) -> Result<OrderAck> {
@@ -962,6 +1014,46 @@ mod tests {
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn query_order_result_parses_existing_order() {
+        let raw = serde_json::json!({
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "status": "FILLED",
+            "orderId": 42,
+            "avgPrice": "50000.0",
+            "executedQty": "0.03",
+        });
+        let result = query_order_result(Ok(raw)).expect("ok");
+        let ack = result.expect("an existing order must parse to Some");
+        assert_eq!(ack.status, "FILLED");
+        assert_eq!(ack.executed_quantity, Decimal::new(3, 2));
+    }
+
+    #[test]
+    fn query_order_result_maps_order_not_found_to_none() {
+        // Binance returns HTTP 400 with code -2013 when the order does not exist.
+        let not_found = TradingError::Exchange(
+            "Binance request failed with 400 Bad Request: {\"code\":-2013,\"msg\":\"Order does not exist.\"}"
+                .to_owned(),
+        );
+        let result = query_order_result(Err(not_found)).expect("not-found must be Ok(None)");
+        assert!(
+            result.is_none(),
+            "a non-existent order must map to Ok(None), not an error"
+        );
+    }
+
+    #[test]
+    fn query_order_result_propagates_other_errors() {
+        let other = TradingError::Timeout("request timed out".to_owned());
+        let result = query_order_result(Err(other));
+        assert!(
+            result.is_err(),
+            "a query that itself failed must surface an error (unknown outcome)"
+        );
     }
 
     #[test]

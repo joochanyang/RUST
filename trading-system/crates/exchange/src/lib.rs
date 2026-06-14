@@ -90,4 +90,10 @@ pub trait ExchangeAdapter: Send + Sync {
         request: ProtectionOrderRequest,
     ) -> Result<ProtectionAck>;
     async fn cancel_order(&self, order_id: String) -> Result<CancelAck>;
+    /// Looks up an order by its client order id. Returns `Ok(Some(_))` if the
+    /// order exists on the exchange, `Ok(None)` if it definitively does not, and
+    /// `Err(_)` if the lookup itself failed (existence unknown). Used to reconcile
+    /// after a placement timeout.
+    async fn query_order(&self, symbol: &Symbol, client_order_id: &str)
+        -> Result<Option<OrderAck>>;
 }

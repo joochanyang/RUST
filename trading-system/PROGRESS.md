@@ -1,11 +1,11 @@
 # PROGRESS — trading-system (Rust 코인선물 AI 트레이딩)
 
-> 마지막 갱신: 2026-06-14 (2차 세션). 다음 세션에서 이 파일부터 읽고 "재개 지점"으로 이동.
+> 마지막 갱신: 2026-06-14 (3차 세션). 다음 세션에서 이 파일부터 읽고 "재개 지점"으로 이동.
 
 ## 현재 상태 (한 줄)
-머니 코렉트니스 6종(C1~H3) + **후속 #1·#2·#3 + 적대적리뷰 확정결함 1건** 수정 완료.
-**테스트 67 통과/0 실패, fmt clean, clippy 13(신규 0).** DB 통합테스트 0건 skip 확인.
-다음은 아래 "남은 후속" 참조(운영확인 + 선택적 reconcile 기능).
+머니 코렉트니스 6종(C1~H3) + 후속 #1·#2·#3 + **타임아웃 자동복구 reconcile(+재시도 하드닝)** 완료.
+**테스트 78 통과/0 실패, fmt clean, clippy 13(신규 0).** DB 통합테스트 0건 skip 확인.
+다음은 아래 "남은 후속" 참조(운영확인 + 선택적 position sweep).
 
 ## 위치 / 저장소
 - 작업 경로: `~/Documents/Rust/trading-system` (⚠️ git repo 루트는 **부모** `~/Documents/Rust`)
@@ -30,10 +30,16 @@
   - **수정(보수적 락)**: `TradingError::Timeout` 변종 추가 + `map_request_error`(reqwest `is_timeout()`로 분류). 진입 Err arm에서 `Timeout`이면 `handle_entry_timeout(...)` → **런타임 LOCK + CRITICAL alert + risk_event(action=`entry_order_timeout_unknown_outcome`)**. 일반 실패는 기존대로 skip. DB e2e 테스트 추가
   - 기각된 3건: http_client fallback(rustls는 build실패 불가), connect_timeout/WS 무타임아웃(WS는 변경무관·hang=무동작), 멱등키 UUID(오늘 무해·랜덤은 항상 수용)
 
+## ✅ 3차 세션 완료 (2026-06-14, 타임아웃 자동복구 reconcile)
+- **reconcile 구현(완전복구)**: `ExchangeAdapter::query_order(symbol, coid) -> Result<Option<OrderAck>>` 추가(Binance=`GET /fapi/v1/order?origClientOrderId=`, `query_order_result` 분류: Ok→Some·code -2013→None·기타Err→Err. bybit/bitget=stub). 진입 타임아웃 시 `reconcile_entry_timeout`: **체결→보호주문(`finalize_entry_with_protection` 공유, 실패시 `handle_protection_failure`)→Registered / 미체결·없음→Skipped(락X) / 조회실패→보수적 LOCK**. `finalize_entry_with_protection`는 정상경로 tail에서 **동작보존 추출**(정상·reconcile 공유)
+- **★확정결함 수정(적대적리뷰 11에이전트, 1확정/7기각)**: reconcile가 타임아웃 직후 **단일 query**로 Skipped 결론 → stale read(체결됐는데 None/NEW)면 무방비+중복. **수정=`query_order_until_settled`**(미체결/없음이면 `RECONCILE_QUERY_ATTEMPTS=3`회·`RECONCILE_QUERY_DELAY=2s` 재시도, 중간 체결시 즉시 보호, 조회Err은 즉시 surface→LOCK). attempts/delay는 함수 인자로 빼서 테스트는 `Duration::ZERO`(빠름)
+  - 기각된 7건 요지: status-string 취약성(애매=LOCK=안전방향), -2013 오분류(체결+미존재 모순), 시장주문 NEW-resting(시장주문은 동기체결), 재시작 영속성(기존 한계·범위밖), Skipped audit 누락(관측성·머니무관)
+- 테스트: reconcile 4분기 e2e + 재시도 3종. RecordingAdapter에 `QueryOrderBehavior`(Filled/ExistsNotFilled/NotFound/QueryFails/NotFilledForFirst) + `query_calls` 카운터
+
 ## ▶ 재개 지점 — "남은 후속" (우선순위 순, 이번 범위 밖)
-1. **(선택) 주문상태 reconcile — 자동복구**: 타임아웃 시 이미 보낸 `client_order_id`로 `GET /fapi/v1/order?origClientOrderId=` 조회 → 체결됐으면 보호주문 진행, 아니면 안전 skip. 현재는 보수적 LOCK만(가용성↓·안전↑). 이게 #2 멱등키의 본래 의도(자동복구). **GET order 엔드포인트 신규구현 필요**
-2. **운영 확인(코드 아님)**: `demo-fapi.binance.com`이 실제 데모/테스트넷인지 testnet 키와 함께 1회 확인 (안전모델 전체가 이 host 문자열에 의존)
-3. **(선택) signal.id 안정화**: `strategy/src/lib.rs:100` `Uuid::new_v4()`가 캔들마다 새 id → 같은 시장조건 재진입은 다른 멱등키. reconcile 도입 시 영향 검토
+1. **운영 확인(코드 아님)**: `demo-fapi.binance.com`이 실제 데모/테스트넷인지 testnet 키와 함께 1회 확인 (안전모델 전체가 이 host 문자열에 의존)
+2. **(선택) 주기적 position sweep**: 캔들 루프에 주기적 `fetch_account_snapshot`로 실제 포지션 vs `open_position_keys` 대조 → 모든 경로의 무방비 포지션 사후 감지(defense-in-depth). reconcile 리뷰에서 제안된 (b)안, 별도 기능
+3. **(선택) signal.id 안정화**: `strategy/src/lib.rs:100` `Uuid::new_v4()`가 캔들마다 새 id → 같은 시장조건 재진입은 다른 멱등키. (현재 무해 — open_position_keys가 1차 가드)
 
 ## 🔧 다음 세션 부팅 명령어 (그대로 복붙)
 ```sh
@@ -46,7 +52,7 @@ psql "$ADMIN_URL" -tAc "SELECT 1 FROM pg_database WHERE datname='trading_system_
   || psql "$ADMIN_URL" -c "CREATE DATABASE trading_system_test;"
 export TEST_DATABASE_URL="${DATABASE_URL%/*}/trading_system_test"
 
-# 2) 그린 베이스라인 확인 (반드시 67 passed / 0 failed 여야 함)
+# 2) 그린 베이스라인 확인 (반드시 78 passed / 0 failed 여야 함)
 cargo test --workspace 2>&1 | grep -oE "[0-9]+ passed" | awk '{s+=$1} END{print s" passed"}'
 cargo fmt --all -- --check && echo "fmt clean"
 cargo clippy --workspace --all-targets 2>&1 | grep -cE "^(warning|error):"   # 13 = 기존 baseline (신규 0)
@@ -60,8 +66,9 @@ cargo clippy --workspace --all-targets 2>&1 | grep -cE "^(warning|error):"   # 1
 - **DB 통합 테스트**는 `TEST_DATABASE_URL` 없으면 조용히 skip됨. 0건 skip 확인할 것
 - 보호가격 반올림 방향: **LONG=floor, SHORT=ceil** (스탑이 entry로 안 당겨지게). `round_protection_price(price, side)`
 - 머니 코드 수정은 항상 **재현 테스트(RED) → 수정 → GREEN** + 적대적 워크플로 검증
-- **타임아웃≠실패**: 주문 HTTP 타임아웃은 결과 UNKNOWN(체결됐을 수 있음). `TradingError::Timeout`으로 분류해 진입에선 LOCK 처리. 절대 일반 실패처럼 silent skip 금지(무방비 포지션 위험). `map_request_error`(binance.rs)·`handle_entry_timeout`(testnet_runtime.rs)
-- 보호실패/타임아웃 복구는 인라인 금지 → `handle_protection_failure`·`handle_entry_timeout` 함수로(테스트 가능 seam)
+- **타임아웃≠실패**: 주문 HTTP 타임아웃은 결과 UNKNOWN(체결됐을 수 있음). `TradingError::Timeout`으로 분류(`map_request_error`). 진입 타임아웃은 **reconcile**(`reconcile_entry_timeout`): query_order로 실제상태 조회→체결이면 보호, 미체결/없음이면 skip, 조회실패면 LOCK. 절대 일반 실패처럼 silent skip 금지
+- **reconcile는 단일 조회 신뢰 금지**: 타임아웃 직후 1회 조회는 stale일 수 있음(체결됐는데 None/NEW). 반드시 `query_order_until_settled`로 재시도(미체결/없음만, Err은 즉시 surface). 미체결 결론은 재시도 소진 후에만
+- 보호실패/타임아웃 복구·보호배치는 인라인 금지 → `handle_protection_failure`·`handle_entry_timeout`·`finalize_entry_with_protection`·`reconcile_entry_timeout` 함수로(테스트 가능 seam)
 - 서브에이전트는 항상 `model: "opus"`
 
 ## 📚 핵심 문서

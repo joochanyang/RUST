@@ -1,6 +1,7 @@
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use trading_ai::{
     AiDecisionProvider, AiEntryGate, AiGateConfig, AiGateDecision, MacroDecision, PatternDecision,
@@ -239,21 +240,32 @@ pub async fn run_binance_testnet_strategy_loop(
             {
                 Ok(order) => order,
                 // A timeout means the order outcome is UNKNOWN — Binance may have
-                // filled it, leaving a naked position. Lock and escalate instead
-                // of silently skipping (which would risk a duplicate re-entry on
-                // the next candle). Definitive failures stay a plain skip.
+                // filled it, leaving a naked position. Reconcile by looking the
+                // order up via its deterministic client order id: recover (protect)
+                // a filled order, skip a non-existent one, or lock if the lookup
+                // itself fails. Definitive (non-timeout) failures stay a plain skip.
                 Err(error @ trading_core::TradingError::Timeout(_)) => {
-                    handle_entry_timeout(
+                    let outcome = reconcile_entry_timeout(
+                        &adapter,
                         &pool,
                         &control,
                         &notifications,
+                        filters,
                         &signal.symbol,
                         signal.side,
+                        position_side,
                         quantity,
+                        stop_loss_price,
+                        take_profit_price,
                         &client_order_id,
                         &error,
+                        RECONCILE_QUERY_ATTEMPTS,
+                        RECONCILE_QUERY_DELAY,
                     )
                     .await;
+                    if outcome == ReconcileOutcome::Registered {
+                        open_position_keys.insert(position_key.clone());
+                    }
                     continue;
                 }
                 Err(error) => {
@@ -271,73 +283,24 @@ pub async fn run_binance_testnet_strategy_loop(
                 }
             };
 
-            let protection = adapter
-                .place_protection_orders(ProtectionOrderRequest {
-                    symbol: signal.symbol.clone(),
-                    position_side,
-                    quantity: order.executed_quantity.max(quantity),
-                    stop_loss_price,
-                    take_profit_price,
-                })
-                .await;
-
-            if let Err(protection_error) = &protection {
-                // Protection placement failed: the market entry left a naked,
-                // unprotected position open. Lock the runtime, flatten it, and
-                // escalate. Never report this as a successful entry and never
-                // register the position key.
-                handle_protection_failure(
-                    &adapter,
-                    &pool,
-                    &control,
-                    &notifications,
-                    filters,
-                    &signal.symbol,
-                    signal.side,
-                    &order,
-                    quantity,
-                    protection_error,
-                )
-                .await;
-
-                // Do not register open_position_keys; the position is (intended to be)
-                // closed, and the runtime is locked pending operator review.
-                continue;
-            }
-
-            if let Err(error) = persist_risk_event(
+            let registered = finalize_entry_with_protection(
+                &adapter,
                 &pool,
-                "info",
-                "binance_testnet",
-                "order_submitted",
-                serde_json::json!({
-                    "symbol": signal.symbol.as_str(),
-                    "side": signal.side.as_str(),
-                    "quantity": quantity,
-                    "order_id": order.exchange_order_id,
-                    "order_status": order.status,
-                    "protection_ok": true
-                }),
-            )
-            .await
-            {
-                tracing::error!(%error, "failed to persist Binance testnet order event");
-            }
-
-            notify(
+                &control,
                 &notifications,
-                format!(
-                    "Binance testnet entry submitted\nsymbol: {}\nside: {}\nqty: {}\nstatus: {}\nstop: {}\ntake: {}",
-                    signal.symbol.as_str(),
-                    signal.side.as_str(),
-                    quantity,
-                    order.status,
-                    stop_loss_price,
-                    take_profit_price
-                ),
+                filters,
+                &signal.symbol,
+                signal.side,
+                position_side,
+                &order,
+                quantity,
+                stop_loss_price,
+                take_profit_price,
             )
             .await;
-            open_position_keys.insert(position_key.clone());
+            if registered {
+                open_position_keys.insert(position_key.clone());
+            }
         }
     }
 }
@@ -482,6 +445,242 @@ async fn handle_entry_timeout(
     .await;
 }
 
+/// Places protection (stop-loss / take-profit) orders for a filled entry and
+/// reports the result. Returns `true` when the position is protected and the
+/// caller should register the position key; `false` when protection failed (the
+/// runtime is then locked and the position flattened via `handle_protection_failure`).
+#[allow(clippy::too_many_arguments)]
+async fn finalize_entry_with_protection(
+    adapter: &dyn ExchangeAdapter,
+    pool: &PgPool,
+    control: &SharedRuntimeControl,
+    notifications: &Option<NotificationSender>,
+    filters: &trading_exchange::binance::SymbolFilters,
+    symbol: &trading_core::Symbol,
+    side: trading_core::Side,
+    position_side: trading_core::PositionSide,
+    order: &OrderAck,
+    quantity: Decimal,
+    stop_loss_price: Decimal,
+    take_profit_price: Decimal,
+) -> bool {
+    let protection = adapter
+        .place_protection_orders(ProtectionOrderRequest {
+            symbol: symbol.clone(),
+            position_side,
+            quantity: order.executed_quantity.max(quantity),
+            stop_loss_price,
+            take_profit_price,
+        })
+        .await;
+
+    if let Err(protection_error) = &protection {
+        // Protection placement failed: the entry left a naked, unprotected
+        // position open. Lock the runtime, flatten it, and escalate. Never
+        // report this as a successful entry and never register the position key.
+        handle_protection_failure(
+            adapter,
+            pool,
+            control,
+            notifications,
+            filters,
+            symbol,
+            side,
+            order,
+            quantity,
+            protection_error,
+        )
+        .await;
+        return false;
+    }
+
+    if let Err(error) = persist_risk_event(
+        pool,
+        "info",
+        "binance_testnet",
+        "order_submitted",
+        serde_json::json!({
+            "symbol": symbol.as_str(),
+            "side": side.as_str(),
+            "quantity": quantity,
+            "order_id": order.exchange_order_id,
+            "order_status": order.status,
+            "protection_ok": true
+        }),
+    )
+    .await
+    {
+        tracing::error!(%error, "failed to persist Binance testnet order event");
+    }
+
+    notify(
+        notifications,
+        format!(
+            "Binance testnet entry submitted\nsymbol: {}\nside: {}\nqty: {}\nstatus: {}\nstop: {}\ntake: {}",
+            symbol.as_str(),
+            side.as_str(),
+            quantity,
+            order.status,
+            stop_loss_price,
+            take_profit_price
+        ),
+    )
+    .await;
+    true
+}
+
+/// How many times to look an order up before concluding it did not fill, and how
+/// long to wait between attempts. Guards against a stale read right after a
+/// placement timeout reporting a freshly-filled order as missing/unfilled.
+const RECONCILE_QUERY_ATTEMPTS: usize = 3;
+const RECONCILE_QUERY_DELAY: Duration = Duration::from_secs(2);
+
+/// Looks an order up repeatedly until it is observed filled or the attempts are
+/// exhausted. Returns as soon as a fill is seen; otherwise returns the last
+/// not-filled/missing result. Any query error is surfaced immediately (the
+/// outcome is unknown and the caller must lock rather than skip). This absorbs a
+/// brief exchange-side read lag so a real fill is never mistaken for "no order".
+async fn query_order_until_settled(
+    adapter: &dyn ExchangeAdapter,
+    symbol: &trading_core::Symbol,
+    client_order_id: &str,
+    attempts: usize,
+    delay: Duration,
+) -> trading_core::Result<Option<OrderAck>> {
+    let mut last = Ok(None);
+    for attempt in 0..attempts.max(1) {
+        match adapter.query_order(symbol, client_order_id).await {
+            Ok(Some(order)) if order_is_filled(&order) => return Ok(Some(order)),
+            other @ Ok(_) => last = other,
+            // Unknown outcome — do not let a transient query error look like "no
+            // position". Surface it so the caller locks conservatively.
+            error @ Err(_) => return error,
+        }
+        if attempt + 1 < attempts.max(1) {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    last
+}
+
+/// Outcome of reconciling an entry order after its placement timed out.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcileOutcome {
+    /// The order was found filled and is now protected — register the position.
+    Registered,
+    /// The order was found filled but protection failed — runtime locked, do not register.
+    NotRegistered,
+    /// The order does not exist or was not filled — no position, safe to skip.
+    Skipped,
+    /// The lookup itself failed — outcome unknown, runtime locked conservatively.
+    Locked,
+}
+
+/// Reconciles an entry order whose placement timed out by looking it up on the
+/// exchange via its (deterministic) client order id:
+/// - filled       → place protection (full recovery) and register the position,
+/// - not filled / missing → no position exists, skip safely,
+/// - lookup failed → outcome unknown, lock the runtime conservatively.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_entry_timeout(
+    adapter: &dyn ExchangeAdapter,
+    pool: &PgPool,
+    control: &SharedRuntimeControl,
+    notifications: &Option<NotificationSender>,
+    filters: &trading_exchange::binance::SymbolFilters,
+    symbol: &trading_core::Symbol,
+    side: trading_core::Side,
+    position_side: trading_core::PositionSide,
+    quantity: Decimal,
+    stop_loss_price: Decimal,
+    take_profit_price: Decimal,
+    client_order_id: &str,
+    timeout_error: &trading_core::TradingError,
+    query_attempts: usize,
+    query_delay: Duration,
+) -> ReconcileOutcome {
+    let settled = query_order_until_settled(
+        adapter,
+        symbol,
+        client_order_id,
+        query_attempts,
+        query_delay,
+    )
+    .await;
+    match settled {
+        Ok(Some(order)) if order_is_filled(&order) => {
+            notify(
+                notifications,
+                format!(
+                    "Binance testnet entry timed out but RECONCILED as filled\nsymbol: {}\nside: {}\nqty: {}\nplacing protection…",
+                    symbol.as_str(),
+                    side.as_str(),
+                    order.executed_quantity,
+                ),
+            )
+            .await;
+            let registered = finalize_entry_with_protection(
+                adapter,
+                pool,
+                control,
+                notifications,
+                filters,
+                symbol,
+                side,
+                position_side,
+                &order,
+                quantity,
+                stop_loss_price,
+                take_profit_price,
+            )
+            .await;
+            if registered {
+                ReconcileOutcome::Registered
+            } else {
+                ReconcileOutcome::NotRegistered
+            }
+        }
+        // Order exists but is not filled, or never reached the exchange: there is
+        // no open position, so it is safe to skip without locking.
+        Ok(_) => {
+            notify(
+                notifications,
+                format!(
+                    "Binance testnet entry timed out; reconciled as NOT filled — safe to skip\nsymbol: {}\nside: {}",
+                    symbol.as_str(),
+                    side.as_str(),
+                ),
+            )
+            .await;
+            ReconcileOutcome::Skipped
+        }
+        // The lookup itself failed: the order's existence is unknown, so fall back
+        // to the conservative lock — a possibly-naked position must not be ignored.
+        Err(query_error) => {
+            handle_entry_timeout(
+                pool,
+                control,
+                notifications,
+                symbol,
+                side,
+                quantity,
+                client_order_id,
+                timeout_error,
+            )
+            .await;
+            tracing::error!(%query_error, "entry-timeout reconcile lookup failed; locked");
+            ReconcileOutcome::Locked
+        }
+    }
+}
+
+/// An order counts as filled (a real position exists) when any quantity executed.
+/// Covers both FILLED and PARTIALLY_FILLED — any non-zero fill is a live position
+/// that must be protected.
+fn order_is_filled(order: &OrderAck) -> bool {
+    order.executed_quantity > Decimal::ZERO
+}
+
 /// Derives a deterministic Binance `newClientOrderId` from a signal id. The
 /// canonical UUID string is exactly 36 chars (Binance's max) and uses only
 /// hyphens and hex digits, all within the accepted charset, so it can be sent
@@ -572,10 +771,31 @@ mod tests {
     use trading_core::{ExchangeId, Side, Symbol, TradingError};
     use trading_exchange::{AccountSnapshot, CancelAck, MarketStream, ProtectionAck};
 
+    // The outcome a test wants `query_order` to return, expressed as a plain
+    // enum so each test can pick a reconcile branch without juggling raw JSON.
+    #[derive(Clone, Default)]
+    enum QueryOrderBehavior {
+        #[default]
+        Unused, // returns Err (existing tests never call query_order)
+        Filled(Decimal),
+        ExistsNotFilled,
+        NotFound,
+        QueryFails,
+        // Returns not-filled for the first N calls, then filled — models a stale
+        // read that settles to filled on a later attempt.
+        NotFilledForFirst(usize, Decimal),
+    }
+
     #[derive(Default)]
     struct RecordingAdapter {
         last_market_order: Mutex<Option<MarketOrderRequest>>,
         fail_market_order: bool,
+        query_behavior: QueryOrderBehavior,
+        // When false (default), protection placement returns Err (matches the old
+        // mock). When true, it records the request and succeeds.
+        protection_succeeds: bool,
+        last_protection_order: Mutex<Option<ProtectionOrderRequest>>,
+        query_calls: Mutex<usize>,
     }
 
     #[async_trait]
@@ -612,13 +832,133 @@ mod tests {
         }
         async fn place_protection_orders(
             &self,
-            _request: ProtectionOrderRequest,
+            request: ProtectionOrderRequest,
         ) -> trading_core::Result<ProtectionAck> {
-            Err(TradingError::Exchange("not used".to_owned()))
+            *self.last_protection_order.lock().unwrap() = Some(request.clone());
+            if !self.protection_succeeds {
+                return Err(TradingError::Exchange("not used".to_owned()));
+            }
+            Ok(ProtectionAck {
+                stop_loss_order_id: Some("sl-1".to_owned()),
+                take_profit_order_id: Some("tp-1".to_owned()),
+                raw: Vec::new(),
+            })
         }
         async fn cancel_order(&self, _order_id: String) -> trading_core::Result<CancelAck> {
             Err(TradingError::Exchange("not used".to_owned()))
         }
+        async fn query_order(
+            &self,
+            symbol: &Symbol,
+            _client_order_id: &str,
+        ) -> trading_core::Result<Option<OrderAck>> {
+            let call_index = {
+                let mut calls = self.query_calls.lock().unwrap();
+                let index = *calls;
+                *calls += 1;
+                index
+            };
+            let filled = |qty: Decimal, status: &str| OrderAck {
+                exchange_order_id: "queried-1".to_owned(),
+                symbol: symbol.clone(),
+                side: Side::Buy,
+                status: status.to_owned(),
+                average_price: None,
+                executed_quantity: qty,
+                raw: serde_json::Value::Null,
+            };
+            match &self.query_behavior {
+                QueryOrderBehavior::Unused => Err(TradingError::Exchange("not used".to_owned())),
+                QueryOrderBehavior::Filled(qty) => Ok(Some(filled(*qty, "FILLED"))),
+                QueryOrderBehavior::ExistsNotFilled => Ok(Some(filled(Decimal::ZERO, "NEW"))),
+                QueryOrderBehavior::NotFound => Ok(None),
+                QueryOrderBehavior::QueryFails => {
+                    Err(TradingError::Timeout("query timed out".to_owned()))
+                }
+                QueryOrderBehavior::NotFilledForFirst(n, qty) => {
+                    if call_index < *n {
+                        Ok(Some(filled(Decimal::ZERO, "NEW")))
+                    } else {
+                        Ok(Some(filled(*qty, "FILLED")))
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn query_until_settled_retries_until_fill_appears() {
+        // First two reads are stale (not filled); the third shows the fill.
+        let adapter = RecordingAdapter {
+            query_behavior: QueryOrderBehavior::NotFilledForFirst(2, Decimal::new(3, 2)),
+            ..RecordingAdapter::default()
+        };
+        let result = query_order_until_settled(
+            &adapter,
+            &Symbol::new("BTCUSDT"),
+            "coid",
+            5,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("query ok");
+        let order = result.expect("a settled fill must be returned");
+        assert!(
+            order_is_filled(&order),
+            "the eventually-visible fill must be detected, not skipped"
+        );
+        assert_eq!(
+            *adapter.query_calls.lock().unwrap(),
+            3,
+            "must retry until the fill appears, then stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_until_settled_returns_not_filled_after_exhausting_attempts() {
+        let adapter = RecordingAdapter {
+            query_behavior: QueryOrderBehavior::ExistsNotFilled,
+            ..RecordingAdapter::default()
+        };
+        let result = query_order_until_settled(
+            &adapter,
+            &Symbol::new("BTCUSDT"),
+            "coid",
+            3,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("query ok");
+        let order = result.expect("an existing-but-unfilled order is still Some");
+        assert!(
+            !order_is_filled(&order),
+            "genuinely not filled after retries"
+        );
+        assert_eq!(
+            *adapter.query_calls.lock().unwrap(),
+            3,
+            "must exhaust all attempts before concluding not filled"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_until_settled_surfaces_query_error() {
+        let adapter = RecordingAdapter {
+            query_behavior: QueryOrderBehavior::QueryFails,
+            ..RecordingAdapter::default()
+        };
+        let result = query_order_until_settled(
+            &adapter,
+            &Symbol::new("BTCUSDT"),
+            "coid",
+            3,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a query error means the outcome is unknown — must surface, not skip"
+        );
     }
 
     #[test]
@@ -866,5 +1206,169 @@ mod tests {
         let action: String = row.get("action");
         assert_eq!(severity, "critical");
         assert_eq!(action, "entry_order_timeout_unknown_outcome");
+    }
+
+    async fn test_pool() -> Option<PgPool> {
+        use sqlx::postgres::PgPoolOptions;
+        let database_url = std::env::var("TEST_DATABASE_URL").ok()?;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect test database");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        Some(pool)
+    }
+
+    fn fresh_control() -> SharedRuntimeControl {
+        std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::dashboard_api::RuntimeControlState::new(TradingMode::Testnet),
+        ))
+    }
+
+    fn zero_filters() -> trading_exchange::binance::SymbolFilters {
+        trading_exchange::binance::SymbolFilters {
+            step_size: Decimal::ZERO,
+            tick_size: Decimal::ZERO,
+            min_qty: Decimal::ZERO,
+            min_notional: Decimal::ZERO,
+        }
+    }
+
+    // Drives reconcile_entry_timeout with the given adapter behavior and returns
+    // (outcome, was the runtime locked?).
+    async fn run_reconcile(
+        pool: &PgPool,
+        adapter: &RecordingAdapter,
+    ) -> (ReconcileOutcome, bool, SharedRuntimeControl) {
+        let control = fresh_control();
+        let (tx, _rx) = mpsc::channel::<String>(8);
+        let outcome = reconcile_entry_timeout(
+            adapter,
+            pool,
+            &control,
+            &Some(tx),
+            &zero_filters(),
+            &Symbol::new("BTCUSDT"),
+            Side::Buy,
+            trading_core::PositionSide::Long,
+            Decimal::new(3, 2),
+            Decimal::new(49000, 0),
+            Decimal::new(51000, 0),
+            "coid-reconcile-test",
+            &TradingError::Timeout("entry timed out".to_owned()),
+            3,
+            Duration::ZERO,
+        )
+        .await;
+        let locked = control.read().await.mode == TradingMode::Locked;
+        (outcome, locked, control)
+    }
+
+    #[tokio::test]
+    async fn reconcile_filled_order_places_protection_and_registers() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping DB integration test; TEST_DATABASE_URL is not set");
+            return;
+        };
+        let adapter = RecordingAdapter {
+            query_behavior: QueryOrderBehavior::Filled(Decimal::new(3, 2)),
+            protection_succeeds: true,
+            ..RecordingAdapter::default()
+        };
+        let (outcome, locked, _control) = run_reconcile(&pool, &adapter).await;
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::Registered,
+            "a filled order with protection placed must register the position"
+        );
+        assert!(!locked, "a fully-recovered entry must not lock the runtime");
+        assert!(
+            adapter.last_protection_order.lock().unwrap().is_some(),
+            "protection orders must be placed on the recovered position"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_filled_order_with_failed_protection_does_not_register() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping DB integration test; TEST_DATABASE_URL is not set");
+            return;
+        };
+        let adapter = RecordingAdapter {
+            query_behavior: QueryOrderBehavior::Filled(Decimal::new(3, 2)),
+            protection_succeeds: false,
+            ..RecordingAdapter::default()
+        };
+        let (outcome, locked, _control) = run_reconcile(&pool, &adapter).await;
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::NotRegistered,
+            "a filled order whose protection fails must not be registered"
+        );
+        assert!(
+            locked,
+            "protection failure on a recovered position must lock (flatten path)"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_unfilled_order_skips_without_locking() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping DB integration test; TEST_DATABASE_URL is not set");
+            return;
+        };
+        let adapter = RecordingAdapter {
+            query_behavior: QueryOrderBehavior::ExistsNotFilled,
+            ..RecordingAdapter::default()
+        };
+        let (outcome, locked, _control) = run_reconcile(&pool, &adapter).await;
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::Skipped,
+            "an order that exists but is not filled means no position — skip"
+        );
+        assert!(!locked, "no naked position, so no lock");
+    }
+
+    #[tokio::test]
+    async fn reconcile_missing_order_skips_without_locking() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping DB integration test; TEST_DATABASE_URL is not set");
+            return;
+        };
+        let adapter = RecordingAdapter {
+            query_behavior: QueryOrderBehavior::NotFound,
+            ..RecordingAdapter::default()
+        };
+        let (outcome, locked, _control) = run_reconcile(&pool, &adapter).await;
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::Skipped,
+            "an order that never reached the exchange means no position — skip"
+        );
+        assert!(!locked, "no position was opened, so no lock");
+    }
+
+    #[tokio::test]
+    async fn reconcile_failed_query_locks_runtime() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping DB integration test; TEST_DATABASE_URL is not set");
+            return;
+        };
+        let adapter = RecordingAdapter {
+            query_behavior: QueryOrderBehavior::QueryFails,
+            ..RecordingAdapter::default()
+        };
+        let (outcome, locked, _control) = run_reconcile(&pool, &adapter).await;
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::Locked,
+            "if the lookup itself fails the outcome is unknown — lock conservatively"
+        );
+        assert!(locked, "unknown outcome must lock the runtime");
     }
 }
