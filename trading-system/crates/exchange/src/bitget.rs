@@ -267,10 +267,15 @@ pub fn parse_kline(payload: &str) -> Result<MarketEvent> {
     let envelope: BitgetKlineEnvelope = serde_json::from_str(payload).map_err(|error| {
         TradingError::Exchange(format!("invalid Bitget kline payload: {error}"))
     })?;
+    // On subscribe Bitget pushes an `action:"snapshot"` batch of up to 500
+    // historical candles ordered oldest-first; live `update` frames carry a
+    // single current candle. Take the LAST row so the snapshot yields the newest
+    // candle instead of an ~8h-stale one (which inflates latency and poisons the
+    // candle buffer). For a single-row update, last == the only row.
     let row = envelope
         .data
         .into_iter()
-        .next()
+        .next_back()
         .ok_or_else(|| TradingError::Exchange("Bitget kline payload has no data".to_owned()))?;
 
     if row.len() < 6 {
@@ -365,6 +370,37 @@ mod tests {
                 assert_eq!(candle.exchange, ExchangeId::Bitget);
                 assert_eq!(candle.symbol.as_str(), "BTCUSDT");
                 assert_eq!(candle.timeframe, "1m");
+            }
+            MarketEvent::OrderBook(_) => panic!("expected candle"),
+        }
+    }
+
+    #[test]
+    fn bitget_snapshot_batch_uses_newest_candle() {
+        // On subscribe Bitget sends an `action:"snapshot"` batch of up to 500
+        // historical candles ordered OLDEST-first (verified against the live v2
+        // ws: first row ~499 min old, last row current). Taking the first row
+        // makes open_time ~8h stale -> the latency gate (correctly) blocks it,
+        // but it also poisons the candle buffer. The parser must emit the NEWEST
+        // (last) row instead.
+        let payload = concat!(
+            r#"{"action":"snapshot","arg":{"instType":"USDT-FUTURES","#,
+            r#""channel":"candle1m","instId":"BTCUSDT"},"data":[["#,
+            r#""1710000000000","68000.1","68020.3","67990.4","68010.2","12.5","850000","850000"],["#,
+            r#""1710000060000","68010.2","68030.0","68000.0","68025.0","11.0","840000","840000"],["#,
+            r#""1710000120000","68025.0","68040.0","68015.0","68035.0","10.0","830000","830000"]],"#,
+            r#""ts":1710000180000}"#
+        );
+        let event = parse_kline(payload).unwrap();
+
+        match event {
+            MarketEvent::Candle(candle) => {
+                assert_eq!(
+                    candle.open_time,
+                    millis_to_utc(1_710_000_120_000).unwrap(),
+                    "snapshot batch must yield the newest candle, not the oldest"
+                );
+                assert_eq!(candle.close, parse_decimal("68035.0").unwrap());
             }
             MarketEvent::OrderBook(_) => panic!("expected candle"),
         }
