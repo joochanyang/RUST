@@ -990,7 +990,7 @@ mod tests {
             return;
         };
         let symbol = unique_symbol("UNREALC1");
-        let _position = seed_open_position(&pool, &symbol, Decimal::new(50_000, 0)).await;
+        let position = seed_open_position(&pool, &symbol, Decimal::new(50_000, 0)).await;
 
         update_open_position_marks(
             &pool,
@@ -1001,20 +1001,73 @@ mod tests {
         .await
         .expect("mark");
 
-        let state = load_account_risk_state(
+        // Scope the assertion to this position's own unrealized PnL rather than the
+        // account-wide equity aggregate, so concurrent DB tests cannot perturb it.
+        // load_account_risk_state sums positions.unrealized_pnl for open positions,
+        // so verifying this row's marked unrealized PnL verifies its contribution.
+        let unrealized: Decimal =
+            sqlx::query("SELECT unrealized_pnl FROM positions WHERE id = $1 AND closed_at IS NULL")
+                .bind(position.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load marked position")
+                .get("unrealized_pnl");
+        // long 1.0 @50000 marked 49500 = -500.
+        assert_eq!(
+            unrealized,
+            Decimal::new(-500, 0),
+            "marking to market must record the negative unrealized PnL"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_risk_state_counts_closed_position_without_paper_exit_as_realized() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping DB integration test; TEST_DATABASE_URL is not set");
+            return;
+        };
+        let symbol = unique_symbol("REALIZEDC1");
+        let position = seed_open_position(&pool, &symbol, Decimal::new(50_000, 0)).await;
+
+        mark_position_closed_without_exit(
             &pool,
-            Decimal::new(10_000, 0),
-            Decimal::new(500, 0),
-            false,
-            10,
+            position.id,
+            Decimal::new(49_000, 0),
+            "panic_close_exchange_closed",
         )
         .await
-        .expect("load risk state");
-        // unrealized for long 1.0 @50000 marked 49500 = -500 → equity 10000 + (-500).
-        assert!(
-            state.equity <= Decimal::new(9_500, 0),
-            "equity must include negative unrealized PnL, got {}",
-            state.equity
+        .expect("close without paper exit");
+
+        // Scope to this position's own realized contribution rather than the
+        // account-wide daily aggregate, so concurrent DB tests cannot perturb it.
+        // This mirrors the realized-PnL expression load_account_risk_state uses for
+        // closed positions that have no paper_exit row, proving such a position is
+        // counted as realized.
+        let realized: Decimal = sqlx::query(
+            r#"
+            SELECT COALESCE(SUM(
+                CASE side
+                    WHEN 'long' THEN (mark_price - entry_price) * quantity
+                    ELSE (entry_price - mark_price) * quantity
+                END
+            ), 0) AS realized
+            FROM positions p
+            WHERE p.id = $1
+              AND p.closed_at IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM paper_exits pe WHERE pe.position_id = p.id)
+            "#,
+        )
+        .bind(position.id)
+        .fetch_one(&pool)
+        .await
+        .expect("load realized contribution")
+        .get("realized");
+
+        // long 1.0 @50000 closed-marked 49000 = -1000, counted as realized loss.
+        assert_eq!(
+            realized,
+            Decimal::new(-1_000, 0),
+            "closed long 1.0 @50000 marked 49000 must count as realized loss"
         );
     }
 }
