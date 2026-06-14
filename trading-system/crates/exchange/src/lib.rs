@@ -65,6 +65,13 @@ pub struct ProtectionOrderRequest {
     pub quantity: Decimal,
     pub stop_loss_price: Decimal,
     pub take_profit_price: Decimal,
+    /// Optional deterministic Binance `clientAlgoId` for the stop-loss leg.
+    /// When set, a timed-out or partially-created protection sequence can be
+    /// compensated by canceling the leg even if the exchange response was lost.
+    pub stop_loss_client_algo_id: Option<String>,
+    /// Optional deterministic Binance `clientAlgoId` for the take-profit leg.
+    /// Used for the same compensation path as the stop-loss leg.
+    pub take_profit_client_algo_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]

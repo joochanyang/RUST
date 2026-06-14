@@ -1,3 +1,4 @@
+use chrono::Utc;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -7,15 +8,23 @@ use trading_ai::{
     AiDecisionProvider, AiEntryGate, AiGateConfig, AiGateDecision, MacroDecision, PatternDecision,
     StaticAiDecisionProvider,
 };
-use trading_core::{Candle, MarketEvent, ObservedMarketEvent, TradingMode};
+use trading_core::{
+    Candle, ExchangeId, MarketEvent, ObservedMarketEvent, Order, OrderFill, OrderStatus, OrderType,
+    Position, ProtectedOrder, ProtectionPlan, TradingMode,
+};
 use trading_exchange::{
     binance::BinanceAdapter, ExchangeAdapter, MarketOrderRequest, OrderAck, ProtectionOrderRequest,
 };
-use trading_risk::{AccountRiskState, BasicRiskGate, RiskGate};
+use trading_risk::{BasicRiskGate, RiskGate};
 use trading_strategy::{Strategy, TechnicalStrategy};
 
 use crate::{
     dashboard_api::SharedRuntimeControl,
+    execution_repository::{
+        load_account_risk_state, load_open_position_keys,
+        load_open_protected_orders_by_mode_and_position, mark_position_closed_without_exit,
+        persist_protected_order, update_open_position_marks,
+    },
     risk_event_repository::{persist_ai_block_risk_event, persist_risk_event},
     signal_repository::persist_signal,
     telegram::NotificationSender,
@@ -112,7 +121,38 @@ pub async fn run_binance_testnet_strategy_loop(
     };
 
     let mut buffers = CandleBuffers::new(config.max_candles_per_key);
-    let mut open_position_keys = HashSet::<String>::new();
+    let mut open_position_keys = match load_open_position_keys(&pool, TradingMode::Testnet).await {
+        Ok(keys) => {
+            if !keys.is_empty() {
+                notify(
+                    &notifications,
+                    format!(
+                        "restored {} open Binance testnet position key(s)",
+                        keys.len()
+                    ),
+                )
+                .await;
+            }
+            keys.into_iter().collect::<HashSet<_>>()
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to restore Binance testnet open positions; locking runtime");
+            {
+                let mut control = control.write().await;
+                control.mode = TradingMode::Locked;
+                control.locked_reason =
+                    Some("failed to restore Binance testnet open positions".to_owned());
+            }
+            notify(
+                &notifications,
+                format!(
+                    "\u{1f6a8} CRITICAL: cannot restore Binance testnet open positions; runtime LOCKED\nreason: {error}"
+                ),
+            )
+            .await;
+            HashSet::new()
+        }
+    };
 
     while let Some(observed) = receiver.recv().await {
         let MarketEvent::Candle(candle) = observed.event else {
@@ -124,17 +164,30 @@ pub async fn run_binance_testnet_strategy_loop(
         }
         let reference_price = candle.close;
         let position_key = format!("{}:{}", exchange.as_str(), candle.symbol.as_str());
+        if let Err(error) =
+            update_open_position_marks(&pool, exchange, &candle.symbol, reference_price).await
+        {
+            tracing::error!(%error, "failed to mark testnet positions on candle close");
+        }
         let candles = match buffers.push(candle) {
             Some(candles) => candles,
             None => continue,
         };
         let locked = control.read().await.mode != TradingMode::Testnet;
-        let account = AccountRiskState {
-            equity: config.equity,
-            daily_realized_pnl: Decimal::ZERO,
-            daily_loss_limit: config.daily_loss_limit,
+        let account = match load_account_risk_state(
+            &pool,
+            config.equity,
+            config.daily_loss_limit,
             locked,
-            market_data_latency_ms: observed.latency_ms,
+            observed.latency_ms,
+        )
+        .await
+        {
+            Ok(account) => account,
+            Err(error) => {
+                tracing::error!(%error, "failed to load testnet account risk state");
+                continue;
+            }
         };
 
         for signal in strategy.evaluate(candles) {
@@ -255,9 +308,11 @@ pub async fn run_binance_testnet_strategy_loop(
                         signal.side,
                         position_side,
                         quantity,
+                        reference_price,
                         stop_loss_price,
                         take_profit_price,
                         &client_order_id,
+                        Some(signal.id),
                         &error,
                         RECONCILE_QUERY_ATTEMPTS,
                         RECONCILE_QUERY_DELAY,
@@ -292,6 +347,9 @@ pub async fn run_binance_testnet_strategy_loop(
                 &signal.symbol,
                 signal.side,
                 position_side,
+                &client_order_id,
+                Some(signal.id),
+                reference_price,
                 &order,
                 quantity,
                 stop_loss_price,
@@ -459,6 +517,9 @@ async fn finalize_entry_with_protection(
     symbol: &trading_core::Symbol,
     side: trading_core::Side,
     position_side: trading_core::PositionSide,
+    entry_client_order_id: &str,
+    signal_id: Option<uuid::Uuid>,
+    reference_price: Decimal,
     order: &OrderAck,
     quantity: Decimal,
     stop_loss_price: Decimal,
@@ -471,6 +532,14 @@ async fn finalize_entry_with_protection(
             quantity: order.executed_quantity.max(quantity),
             stop_loss_price,
             take_profit_price,
+            stop_loss_client_algo_id: Some(protection_client_algo_id_for_entry(
+                entry_client_order_id,
+                "sl",
+            )),
+            take_profit_client_algo_id: Some(protection_client_algo_id_for_entry(
+                entry_client_order_id,
+                "tp",
+            )),
         })
         .await;
 
@@ -494,6 +563,57 @@ async fn finalize_entry_with_protection(
         return false;
     }
 
+    let protection = protection.expect("checked above");
+    let protected_order = protected_order_from_testnet_ack(
+        signal_id,
+        symbol,
+        side,
+        position_side,
+        order,
+        quantity,
+        reference_price,
+        stop_loss_price,
+        take_profit_price,
+    );
+    if let Err(error) = persist_protected_order(pool, &protected_order).await {
+        {
+            let mut control = control.write().await;
+            control.mode = TradingMode::Locked;
+            control.locked_reason =
+                Some("failed to persist Binance testnet protected position".to_owned());
+        }
+        if let Err(persist_error) = persist_risk_event(
+            pool,
+            "critical",
+            "binance_testnet",
+            "protected_position_persistence_failed",
+            serde_json::json!({
+                "symbol": symbol.as_str(),
+                "side": side.as_str(),
+                "quantity": quantity,
+                "entry_order_id": order.exchange_order_id,
+                "entry_order_status": order.status,
+                "protection_raw": protection.raw,
+                "error": error.to_string(),
+            }),
+        )
+        .await
+        {
+            tracing::error!(%persist_error, "failed to persist testnet persistence-failure risk event");
+        }
+        notify(
+            notifications,
+            format!(
+                "\u{1f6a8} CRITICAL: testnet protected position persisted FAILED\nsymbol: {}\nside: {}\nqty: {}\nruntime LOCKED\nreason: {error}",
+                symbol.as_str(),
+                side.as_str(),
+                quantity,
+            ),
+        )
+        .await;
+        return true;
+    }
+
     if let Err(error) = persist_risk_event(
         pool,
         "info",
@@ -505,6 +625,8 @@ async fn finalize_entry_with_protection(
             "quantity": quantity,
             "order_id": order.exchange_order_id,
             "order_status": order.status,
+            "stop_loss_order_id": protection.stop_loss_order_id,
+            "take_profit_order_id": protection.take_profit_order_id,
             "protection_ok": true
         }),
     )
@@ -527,6 +649,83 @@ async fn finalize_entry_with_protection(
     )
     .await;
     true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn protected_order_from_testnet_ack(
+    signal_id: Option<uuid::Uuid>,
+    symbol: &trading_core::Symbol,
+    side: trading_core::Side,
+    position_side: trading_core::PositionSide,
+    order: &OrderAck,
+    planned_quantity: Decimal,
+    reference_price: Decimal,
+    stop_loss_price: Decimal,
+    take_profit_price: Decimal,
+) -> ProtectedOrder {
+    let now = Utc::now();
+    let entry_order_id = uuid::Uuid::new_v4();
+    let position_id = uuid::Uuid::new_v4();
+    let filled_quantity = if order.executed_quantity > Decimal::ZERO {
+        order.executed_quantity
+    } else {
+        planned_quantity
+    };
+    let entry_price = order.average_price.unwrap_or(reference_price);
+
+    ProtectedOrder {
+        entry_order: Order {
+            id: entry_order_id,
+            signal_id,
+            exchange: ExchangeId::Binance,
+            exchange_order_id: Some(order.exchange_order_id.clone()),
+            mode: TradingMode::Testnet,
+            symbol: symbol.clone(),
+            side,
+            order_type: OrderType::Market,
+            status: order_status_from_ack(&order.status, filled_quantity),
+            price: Some(entry_price),
+            quantity: filled_quantity,
+            created_at: now,
+        },
+        fill: OrderFill {
+            order_id: entry_order_id,
+            exchange: ExchangeId::Binance,
+            symbol: symbol.clone(),
+            side,
+            price: entry_price,
+            quantity: filled_quantity,
+            filled_at: now,
+        },
+        position: Position {
+            id: position_id,
+            exchange: ExchangeId::Binance,
+            symbol: symbol.clone(),
+            side: position_side,
+            entry_price,
+            mark_price: entry_price,
+            quantity: filled_quantity,
+            leverage: Decimal::ONE,
+            unrealized_pnl: Decimal::ZERO,
+            opened_at: now,
+        },
+        protection: ProtectionPlan {
+            stop_loss_price,
+            take_profit_price,
+        },
+    }
+}
+
+fn order_status_from_ack(status: &str, filled_quantity: Decimal) -> OrderStatus {
+    match status {
+        "FILLED" => OrderStatus::Filled,
+        "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
+        "CANCELED" | "CANCELLED" => OrderStatus::Canceled,
+        "REJECTED" | "EXPIRED" => OrderStatus::Rejected,
+        "NEW" => OrderStatus::New,
+        _ if filled_quantity > Decimal::ZERO => OrderStatus::Filled,
+        _ => OrderStatus::New,
+    }
 }
 
 /// How many times to look an order up before concluding it did not fill, and how
@@ -592,9 +791,11 @@ async fn reconcile_entry_timeout(
     side: trading_core::Side,
     position_side: trading_core::PositionSide,
     quantity: Decimal,
+    reference_price: Decimal,
     stop_loss_price: Decimal,
     take_profit_price: Decimal,
     client_order_id: &str,
+    signal_id: Option<uuid::Uuid>,
     timeout_error: &trading_core::TradingError,
     query_attempts: usize,
     query_delay: Duration,
@@ -628,6 +829,9 @@ async fn reconcile_entry_timeout(
                 symbol,
                 side,
                 position_side,
+                client_order_id,
+                signal_id,
+                reference_price,
                 &order,
                 quantity,
                 stop_loss_price,
@@ -690,6 +894,24 @@ fn client_order_id_for_signal(signal_id: uuid::Uuid) -> String {
     signal_id.to_string()
 }
 
+/// Derives deterministic Binance `clientAlgoId` values from the entry
+/// `newClientOrderId`. Binance caps ids at 36 chars; compacting the UUID entry
+/// id to 32 hex chars leaves room for `-sl` / `-tp` while staying unique per
+/// signal and safe for retry/cancel compensation.
+fn protection_client_algo_id_for_entry(entry_client_order_id: &str, leg: &str) -> String {
+    let mut base = entry_client_order_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>();
+    if base.is_empty() {
+        base = "entry".to_owned();
+    }
+    let suffix = format!("-{leg}");
+    let max_base_len = 36_usize.saturating_sub(suffix.len());
+    base.truncate(max_base_len);
+    format!("{base}{suffix}")
+}
+
 /// Closes an open position with a reduce-only market order on the opposite side.
 ///
 /// `reduce_only` guarantees the order can only shrink/close the position and can
@@ -714,6 +936,105 @@ async fn flatten_position(
             client_order_id: None,
         })
         .await
+}
+
+pub async fn close_open_binance_testnet_positions(
+    pool: &PgPool,
+    adapter: &dyn ExchangeAdapter,
+    position_id: Option<uuid::Uuid>,
+    trigger: trading_execution::ProtectionTrigger,
+) -> trading_core::Result<u64> {
+    let protected_orders =
+        load_open_protected_orders_by_mode_and_position(pool, TradingMode::Testnet, position_id)
+            .await?;
+    let mut closed = 0;
+
+    for protected_order in protected_orders {
+        let cancel_failures = cancel_testnet_protection_orders(adapter, &protected_order).await;
+        let position = &protected_order.position;
+        let flatten = flatten_position(
+            adapter,
+            &position.symbol,
+            protected_order.entry_order.side,
+            position.quantity,
+        )
+        .await;
+
+        let flatten_ack = match flatten {
+            Ok(ack) => ack,
+            Err(error) => {
+                persist_risk_event(
+                    pool,
+                    "critical",
+                    "binance_testnet",
+                    "panic_close_flatten_failed",
+                    serde_json::json!({
+                        "position_id": position.id,
+                        "symbol": position.symbol.as_str(),
+                        "side": position.side.as_str(),
+                        "quantity": position.quantity,
+                        "trigger": trigger.as_str(),
+                        "cancel_failures": cancel_failures,
+                        "error": error.to_string(),
+                    }),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+
+        let close_price = flatten_ack.average_price.unwrap_or(position.mark_price);
+        if mark_position_closed_without_exit(
+            pool,
+            position.id,
+            close_price,
+            &format!("{}_exchange_closed", trigger.as_str()),
+        )
+        .await?
+        {
+            closed += 1;
+        }
+
+        persist_risk_event(
+            pool,
+            "critical",
+            "binance_testnet",
+            "panic_close_exchange_flattened",
+            serde_json::json!({
+                "position_id": position.id,
+                "symbol": position.symbol.as_str(),
+                "side": position.side.as_str(),
+                "quantity": position.quantity,
+                "trigger": trigger.as_str(),
+                "flatten_order_id": flatten_ack.exchange_order_id,
+                "cancel_failures": cancel_failures,
+            }),
+        )
+        .await?;
+    }
+
+    Ok(closed)
+}
+
+async fn cancel_testnet_protection_orders(
+    adapter: &dyn ExchangeAdapter,
+    protected_order: &ProtectedOrder,
+) -> Vec<String> {
+    let Some(signal_id) = protected_order.entry_order.signal_id else {
+        return vec![format!(
+            "position {} has no signal_id; cannot derive Binance clientAlgoId",
+            protected_order.position.id
+        )];
+    };
+    let entry_client_order_id = client_order_id_for_signal(signal_id);
+    let mut failures = Vec::new();
+    for leg in ["sl", "tp"] {
+        let client_algo_id = protection_client_algo_id_for_entry(&entry_client_order_id, leg);
+        if let Err(error) = adapter.cancel_order(client_algo_id.clone()).await {
+            failures.push(format!("{client_algo_id}: {error}"));
+        }
+    }
+    failures
 }
 
 async fn notify(sender: &Option<NotificationSender>, message: String) {
@@ -796,6 +1117,8 @@ mod tests {
         protection_succeeds: bool,
         last_protection_order: Mutex<Option<ProtectionOrderRequest>>,
         query_calls: Mutex<usize>,
+        cancel_succeeds: bool,
+        cancelled_orders: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -844,8 +1167,14 @@ mod tests {
                 raw: Vec::new(),
             })
         }
-        async fn cancel_order(&self, _order_id: String) -> trading_core::Result<CancelAck> {
-            Err(TradingError::Exchange("not used".to_owned()))
+        async fn cancel_order(&self, order_id: String) -> trading_core::Result<CancelAck> {
+            self.cancelled_orders.lock().unwrap().push(order_id);
+            if !self.cancel_succeeds {
+                return Err(TradingError::Exchange("not used".to_owned()));
+            }
+            Ok(CancelAck {
+                raw: serde_json::Value::Null,
+            })
         }
         async fn query_order(
             &self,
@@ -983,6 +1312,108 @@ mod tests {
             client_order_id_for_signal(id),
             client_order_id_for_signal(id),
             "same signal id must yield the same client order id for idempotency"
+        );
+    }
+
+    #[test]
+    fn protection_client_algo_ids_are_short_safe_and_leg_specific() {
+        let entry = client_order_id_for_signal(uuid::Uuid::nil());
+        let stop_loss = protection_client_algo_id_for_entry(&entry, "sl");
+        let take_profit = protection_client_algo_id_for_entry(&entry, "tp");
+
+        assert_ne!(
+            stop_loss, take_profit,
+            "stop-loss and take-profit legs must have distinct ids"
+        );
+        for id in [stop_loss, take_profit] {
+            assert!(id.len() <= 36, "Binance clientAlgoId max length is 36");
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '/' | '_' | '-')),
+                "must only use Binance-accepted characters: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn testnet_ack_builds_persistable_protected_order() {
+        let signal_id = uuid::Uuid::new_v4();
+        let order = OrderAck {
+            exchange_order_id: "binance-entry-1".to_owned(),
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            status: "FILLED".to_owned(),
+            average_price: Some(Decimal::new(50_100, 0)),
+            executed_quantity: Decimal::new(2, 2),
+            raw: serde_json::Value::Null,
+        };
+
+        let protected = protected_order_from_testnet_ack(
+            Some(signal_id),
+            &Symbol::new("BTCUSDT"),
+            Side::Buy,
+            trading_core::PositionSide::Long,
+            &order,
+            Decimal::new(3, 2),
+            Decimal::new(50_000, 0),
+            Decimal::new(49_000, 0),
+            Decimal::new(51_000, 0),
+        );
+
+        assert_eq!(protected.entry_order.signal_id, Some(signal_id));
+        assert_eq!(protected.entry_order.mode, TradingMode::Testnet);
+        assert_eq!(
+            protected.entry_order.exchange_order_id.as_deref(),
+            Some("binance-entry-1")
+        );
+        assert_eq!(
+            protected.entry_order.status,
+            trading_core::OrderStatus::Filled
+        );
+        assert_eq!(
+            protected.fill.quantity,
+            Decimal::new(2, 2),
+            "persist the executed quantity, not the larger planned quantity"
+        );
+        assert_eq!(protected.position.entry_price, Decimal::new(50_100, 0));
+        assert_eq!(
+            protected.protection.stop_loss_price,
+            Decimal::new(49_000, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn testnet_protection_cancel_uses_persisted_signal_id() {
+        let signal_id = uuid::Uuid::new_v4();
+        let entry_client_order_id = client_order_id_for_signal(signal_id);
+        let order = order_ack("BTCUSDT", Side::Buy, Decimal::new(2, 2));
+        let protected = protected_order_from_testnet_ack(
+            Some(signal_id),
+            &Symbol::new("BTCUSDT"),
+            Side::Buy,
+            trading_core::PositionSide::Long,
+            &order,
+            Decimal::new(2, 2),
+            Decimal::new(50_000, 0),
+            Decimal::new(49_000, 0),
+            Decimal::new(51_000, 0),
+        );
+        let adapter = RecordingAdapter {
+            cancel_succeeds: true,
+            ..RecordingAdapter::default()
+        };
+
+        let failures = cancel_testnet_protection_orders(&adapter, &protected).await;
+
+        assert!(failures.is_empty(), "cancel should succeed: {failures:?}");
+        let cancelled = adapter.cancelled_orders.lock().unwrap().clone();
+        assert_eq!(
+            cancelled,
+            vec![
+                protection_client_algo_id_for_entry(&entry_client_order_id, "sl"),
+                protection_client_algo_id_for_entry(&entry_client_order_id, "tp"),
+            ],
+            "panic close must cancel both deterministic protection legs"
         );
     }
 
@@ -1269,9 +1700,11 @@ mod tests {
             Side::Buy,
             trading_core::PositionSide::Long,
             Decimal::new(3, 2),
+            Decimal::new(50_000, 0),
             Decimal::new(49000, 0),
             Decimal::new(51000, 0),
             "coid-reconcile-test",
+            Some(uuid::Uuid::nil()),
             &TradingError::Timeout("entry timed out".to_owned()),
             3,
             Duration::ZERO,

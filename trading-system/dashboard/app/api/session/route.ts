@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   clearDashboardSession,
+  dashboardAuthConfigError,
   isDashboardAuthConfigured,
   isDashboardAuthenticated,
   setDashboardSession,
@@ -8,13 +9,20 @@ import {
 } from "../../../lib/auth";
 
 export async function GET() {
+  const configError = dashboardAuthConfigError();
   return NextResponse.json({
     authRequired: isDashboardAuthConfigured(),
-    authenticated: await isDashboardAuthenticated()
+    authenticated: await isDashboardAuthenticated(),
+    error: configError
   });
 }
 
 export async function POST(request: NextRequest) {
+  const configError = dashboardAuthConfigError();
+  if (configError) {
+    return NextResponse.json({ error: configError }, { status: 500 });
+  }
+
   if (!isDashboardAuthConfigured()) {
     return NextResponse.json({ authenticated: true });
   }

@@ -17,8 +17,9 @@ use trading_core::{Result, TradingError, TradingMode};
 
 use crate::{
     execution_repository::close_open_paper_positions, risk_event_repository::persist_risk_event,
-    settings::Settings,
+    settings::Settings, testnet_runtime::close_open_binance_testnet_positions,
 };
+use trading_exchange::binance::BinanceAdapter;
 use trading_execution::ProtectionTrigger;
 use uuid::Uuid;
 
@@ -49,6 +50,11 @@ pub struct DashboardState {
 #[derive(Debug, Deserialize)]
 pub struct LimitQuery {
     limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DashboardWsQuery {
+    token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -293,7 +299,7 @@ pub async fn panic_close(
     }
 
     let affected =
-        match close_open_paper_positions(&state.pool, None, ProtectionTrigger::PanicClose).await {
+        match close_open_positions_for_control(&state, None, ProtectionTrigger::PanicClose).await {
             Ok(affected) => affected,
             Err(error) => return api_error(error),
         };
@@ -318,6 +324,46 @@ pub async fn panic_close(
         }),
     )
         .into_response()
+}
+
+pub async fn close_open_positions_for_control(
+    state: &DashboardState,
+    position_id: Option<Uuid>,
+    trigger: ProtectionTrigger,
+) -> Result<u64> {
+    match state.settings.trading.mode {
+        TradingMode::Paper => close_open_paper_positions(&state.pool, position_id, trigger).await,
+        TradingMode::Testnet => {
+            let api_key = state
+                .settings
+                .binance_testnet
+                .api_key
+                .clone()
+                .ok_or_else(|| {
+                    TradingError::Configuration(
+                        "BINANCE_TESTNET_API_KEY is required for testnet panic close".to_owned(),
+                    )
+                })?;
+            let api_secret = state
+                .settings
+                .binance_testnet
+                .api_secret
+                .clone()
+                .ok_or_else(|| {
+                    TradingError::Configuration(
+                        "BINANCE_TESTNET_API_SECRET is required for testnet panic close".to_owned(),
+                    )
+                })?;
+            let adapter = BinanceAdapter::testnet(api_key, api_secret);
+            close_open_binance_testnet_positions(&state.pool, &adapter, position_id, trigger).await
+        }
+        TradingMode::Live => Err(TradingError::Configuration(
+            "live panic close is not implemented".to_owned(),
+        )),
+        TradingMode::Locked => Err(TradingError::Configuration(
+            "TRADING_MODE=locked has no configured close path".to_owned(),
+        )),
+    }
 }
 
 pub async fn ack_risk_event(
@@ -386,8 +432,8 @@ pub async fn close_position(
                 .into_response()
         }
     };
-    let affected = match close_open_paper_positions(
-        &state.pool,
+    let affected = match close_open_positions_for_control(
+        &state,
         Some(position_id),
         ProtectionTrigger::ManualClose,
     )
@@ -419,7 +465,16 @@ pub async fn close_position(
         .into_response()
 }
 
-pub async fn dashboard_ws(State(state): State<DashboardState>, ws: WebSocketUpgrade) -> Response {
+pub async fn dashboard_ws(
+    State(state): State<DashboardState>,
+    Query(query): Query<DashboardWsQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Some(response) = require_control_token_value(&state, &headers, query.token.as_deref()) {
+        return response;
+    }
+
     ws.on_upgrade(move |mut socket| async move {
         loop {
             let payload = match dashboard_snapshot_response(&state).await {
@@ -428,7 +483,7 @@ pub async fn dashboard_ws(State(state): State<DashboardState>, ws: WebSocketUpgr
             };
 
             if socket
-                .send(Message::Text(payload.to_string().into()))
+                .send(Message::Text(payload.to_string()))
                 .await
                 .is_err()
             {
@@ -729,12 +784,20 @@ fn api_error(error: TradingError) -> axum::response::Response {
 }
 
 pub fn require_control_token(state: &DashboardState, headers: &HeaderMap) -> Option<Response> {
+    require_control_token_value(state, headers, None)
+}
+
+fn require_control_token_value(
+    state: &DashboardState,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Option<Response> {
     let expected = state.settings.dashboard_control_token.as_ref()?;
     let provided = headers
         .get("x-dashboard-control-token")
         .and_then(|value| value.to_str().ok());
 
-    if provided == Some(expected.as_str()) {
+    if provided == Some(expected.as_str()) || query_token == Some(expected.as_str()) {
         None
     } else {
         Some(

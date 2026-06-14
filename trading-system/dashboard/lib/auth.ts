@@ -8,12 +8,16 @@ const sessionMaxAgeSeconds = 12 * 60 * 60;
 type CookieOptions = Parameters<NextResponse["cookies"]["set"]>[2];
 
 export function isDashboardAuthConfigured() {
-  return Boolean(process.env.DASHBOARD_PASSWORD);
+  return Boolean(process.env.DASHBOARD_PASSWORD) || isProduction();
 }
 
 export async function isDashboardAuthenticated() {
   if (!isDashboardAuthConfigured()) {
     return true;
+  }
+
+  if (dashboardAuthConfigError()) {
+    return false;
   }
 
   const cookieStore = await cookies();
@@ -22,6 +26,11 @@ export async function isDashboardAuthenticated() {
 }
 
 export async function requireDashboardAuth() {
+  const configError = dashboardAuthConfigError();
+  if (configError) {
+    return NextResponse.json({ error: configError }, { status: 500 });
+  }
+
   if (await isDashboardAuthenticated()) {
     return null;
   }
@@ -32,6 +41,19 @@ export async function requireDashboardAuth() {
 export function validateDashboardPassword(password: string) {
   const expected = process.env.DASHBOARD_PASSWORD;
   return Boolean(expected && safeEqual(password, expected));
+}
+
+export function dashboardAuthConfigError() {
+  if (!isProduction()) {
+    return null;
+  }
+  if (!process.env.DASHBOARD_PASSWORD) {
+    return "DASHBOARD_PASSWORD is required in production";
+  }
+  if (!process.env.DASHBOARD_SESSION_SECRET) {
+    return "DASHBOARD_SESSION_SECRET is required in production";
+  }
+  return null;
 }
 
 export function setDashboardSession(response: NextResponse) {
@@ -70,6 +92,10 @@ function sign(payload: string) {
 
 function sessionSecret() {
   return process.env.DASHBOARD_SESSION_SECRET ?? process.env.DASHBOARD_PASSWORD ?? "local-dashboard-session";
+}
+
+function isProduction() {
+  return process.env.NODE_ENV === "production";
 }
 
 function safeEqual(left: string, right: string) {

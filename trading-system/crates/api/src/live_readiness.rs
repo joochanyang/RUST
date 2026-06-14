@@ -12,8 +12,7 @@ use trading_core::{Result, TradingError, TradingMode};
 use uuid::Uuid;
 
 use crate::{
-    dashboard_api::{require_control_token, DashboardState},
-    execution_repository::close_open_paper_positions,
+    dashboard_api::{close_open_positions_for_control, require_control_token, DashboardState},
     risk_event_repository::persist_risk_event,
 };
 use trading_execution::ProtectionTrigger;
@@ -364,7 +363,7 @@ async fn run_killswitch_panic_close(state: &DashboardState) -> Result<Value> {
     }
 
     let closed_positions =
-        close_open_paper_positions(&state.pool, None, ProtectionTrigger::PanicClose).await?;
+        close_open_positions_for_control(state, None, ProtectionTrigger::PanicClose).await?;
 
     persist_risk_event(
         &state.pool,

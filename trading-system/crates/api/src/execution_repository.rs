@@ -18,10 +18,10 @@ pub async fn persist_protected_order(
         .await
         .map_err(|error| TradingError::Database(error.to_string()))?;
 
-    insert_order(&mut *transaction, protected_order).await?;
-    insert_fill(&mut *transaction, protected_order).await?;
-    insert_position(&mut *transaction, protected_order).await?;
-    insert_protection(&mut *transaction, protected_order).await?;
+    insert_order(&mut transaction, protected_order).await?;
+    insert_fill(&mut transaction, protected_order).await?;
+    insert_position(&mut transaction, protected_order).await?;
+    insert_protection(&mut transaction, protected_order).await?;
 
     transaction
         .commit()
@@ -246,8 +246,12 @@ pub async fn close_open_paper_positions(
         .begin()
         .await
         .map_err(|error| TradingError::Database(error.to_string()))?;
-    let protected_orders =
-        load_open_protected_orders_with_connection(&mut *transaction, position_id).await?;
+    let protected_orders = load_open_protected_orders_with_connection(
+        &mut *transaction,
+        position_id,
+        Some(TradingMode::Paper),
+    )
+    .await?;
     let close_time = Utc::now();
     let mut closed = 0;
 
@@ -272,8 +276,8 @@ pub async fn close_open_paper_positions(
         // idempotent on its own (not just via the SELECT ... FOR UPDATE above),
         // so it can never write a duplicate paper_exits row for a position that
         // was already closed out-of-band.
-        if close_position_for_exit(&mut *transaction, &exit).await? {
-            insert_paper_exit(&mut *transaction, &exit).await?;
+        if close_position_for_exit(&mut transaction, &exit).await? {
+            insert_paper_exit(&mut transaction, &exit).await?;
             closed += 1;
         }
     }
@@ -287,12 +291,110 @@ pub async fn close_open_paper_positions(
 }
 
 pub async fn load_open_protected_orders(pool: &PgPool) -> Result<Vec<ProtectedOrder>> {
+    load_open_protected_orders_by_mode(pool, TradingMode::Paper).await
+}
+
+pub async fn load_open_protected_orders_by_mode(
+    pool: &PgPool,
+    mode: TradingMode,
+) -> Result<Vec<ProtectedOrder>> {
+    load_open_protected_orders_by_mode_and_position(pool, mode, None).await
+}
+
+pub async fn load_open_protected_orders_by_mode_and_position(
+    pool: &PgPool,
+    mode: TradingMode,
+    position_id: Option<Uuid>,
+) -> Result<Vec<ProtectedOrder>> {
     let mut connection = pool
         .acquire()
         .await
         .map_err(|error| TradingError::Database(error.to_string()))?;
 
-    load_open_protected_orders_with_connection(&mut *connection, None).await
+    load_open_protected_orders_with_connection(&mut *connection, position_id, Some(mode)).await
+}
+
+pub async fn load_open_position_keys(pool: &PgPool, mode: TradingMode) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT p.exchange, p.symbol
+        FROM positions p
+        JOIN protection_orders po ON po.position_id = p.id
+        JOIN orders o ON o.id = po.entry_order_id
+        WHERE p.closed_at IS NULL
+          AND o.mode = $1
+        "#,
+    )
+    .bind(mode.as_str())
+    .fetch_all(pool)
+    .await
+    .map_err(|error| TradingError::Database(error.to_string()))?;
+
+    rows.into_iter()
+        .map(|row| {
+            let exchange = parse_exchange(row.get::<String, _>("exchange").as_str())?;
+            let symbol = Symbol::new(row.get::<String, _>("symbol"));
+            Ok(format!("{}:{}", exchange.as_str(), symbol.as_str()))
+        })
+        .collect()
+}
+
+pub async fn mark_position_closed_without_exit(
+    pool: &PgPool,
+    position_id: Uuid,
+    mark_price: Decimal,
+    protection_status: &str,
+) -> Result<bool> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|error| TradingError::Database(error.to_string()))?;
+
+    let closed = sqlx::query(
+        r#"
+        UPDATE positions
+        SET mark_price = $1,
+            unrealized_pnl = 0,
+            closed_at = $2
+        WHERE id = $3
+          AND closed_at IS NULL
+        "#,
+    )
+    .bind(mark_price)
+    .bind(Utc::now())
+    .bind(position_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| TradingError::Database(error.to_string()))?
+    .rows_affected();
+
+    if closed == 0 {
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| TradingError::Database(error.to_string()))?;
+        return Ok(false);
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE protection_orders
+        SET status = $1
+        WHERE position_id = $2
+        "#,
+    )
+    .bind(protection_status)
+    .bind(position_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| TradingError::Database(error.to_string()))?;
+
+    transaction
+        .commit()
+        .await
+        .map_err(|error| TradingError::Database(error.to_string()))?;
+
+    Ok(true)
 }
 
 async fn insert_paper_exit(connection: &mut PgConnection, exit: &PaperExit) -> Result<()> {
@@ -415,11 +517,41 @@ pub async fn load_account_risk_state(
     let row = sqlx::query(
         r#"
         SELECT
-            (SELECT COALESCE(SUM(realized_pnl), 0) FROM paper_exits) AS total_realized_pnl,
             (
-                SELECT COALESCE(SUM(realized_pnl), 0)
-                FROM paper_exits
-                WHERE triggered_at >= date_trunc('day', now())
+                (SELECT COALESCE(SUM(realized_pnl), 0) FROM paper_exits)
+                +
+                (
+                    SELECT COALESCE(SUM(
+                        CASE side
+                            WHEN 'long' THEN (mark_price - entry_price) * quantity
+                            ELSE (entry_price - mark_price) * quantity
+                        END
+                    ), 0)
+                    FROM positions p
+                    WHERE closed_at IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM paper_exits pe WHERE pe.position_id = p.id
+                      )
+                )
+            ) AS total_realized_pnl,
+            (
+                (SELECT COALESCE(SUM(realized_pnl), 0)
+                 FROM paper_exits
+                 WHERE triggered_at >= date_trunc('day', now()))
+                +
+                (
+                    SELECT COALESCE(SUM(
+                        CASE side
+                            WHEN 'long' THEN (mark_price - entry_price) * quantity
+                            ELSE (entry_price - mark_price) * quantity
+                        END
+                    ), 0)
+                    FROM positions p
+                    WHERE closed_at >= date_trunc('day', now())
+                      AND NOT EXISTS (
+                          SELECT 1 FROM paper_exits pe WHERE pe.position_id = p.id
+                      )
+                )
             ) AS daily_realized_pnl,
             (
                 SELECT COALESCE(SUM(unrealized_pnl), 0)
@@ -448,6 +580,7 @@ pub async fn load_account_risk_state(
 async fn load_open_protected_orders_with_connection<'e, E>(
     executor: E,
     position_id: Option<Uuid>,
+    mode: Option<TradingMode>,
 ) -> Result<Vec<ProtectedOrder>>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
@@ -486,11 +619,13 @@ where
         JOIN order_fills f ON f.order_id = o.id
         WHERE p.closed_at IS NULL
           AND ($1::uuid IS NULL OR p.id = $1)
+          AND ($2::text IS NULL OR o.mode = $2)
         ORDER BY p.opened_at ASC
         FOR UPDATE OF p, po
         "#,
     )
     .bind(position_id)
+    .bind(mode.map(|mode| mode.as_str()))
     .fetch_all(executor)
     .await
     .map_err(|error| TradingError::Database(error.to_string()))?;

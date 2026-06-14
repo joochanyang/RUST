@@ -8,8 +8,7 @@ use trading_core::{Result, TradingError, TradingMode};
 use trading_execution::ProtectionTrigger;
 
 use crate::{
-    dashboard_api::{unlock_target_mode, DashboardState},
-    execution_repository::close_open_paper_positions,
+    dashboard_api::{close_open_positions_for_control, unlock_target_mode, DashboardState},
     live_readiness::LiveReadinessResponse,
     risk_event_repository::persist_risk_event,
 };
@@ -41,7 +40,7 @@ impl TelegramClient {
             }))
             .send()
             .await
-            .map_err(|error| TradingError::Exchange(error.to_string()))?;
+            .map_err(|error| TradingError::Exchange(reqwest_error_message(error)))?;
 
         decode_telegram_response(response).await.map(|_| ())
     }
@@ -61,7 +60,7 @@ impl TelegramClient {
             .json(&body)
             .send()
             .await
-            .map_err(|error| TradingError::Exchange(error.to_string()))?;
+            .map_err(|error| TradingError::Exchange(reqwest_error_message(error)))?;
         let value = decode_telegram_response(response).await?;
 
         serde_json::from_value(value["result"].clone())
@@ -276,7 +275,7 @@ async fn panic_close(state: &DashboardState) -> Result<u64> {
         control.locked_reason = Some("telegram panic close".to_owned());
     }
     let closed =
-        close_open_paper_positions(&state.pool, None, ProtectionTrigger::PanicClose).await?;
+        close_open_positions_for_control(state, None, ProtectionTrigger::PanicClose).await?;
 
     persist_risk_event(
         &state.pool,
@@ -295,7 +294,7 @@ async fn decode_telegram_response(response: reqwest::Response) -> Result<Value> 
     let body = response
         .text()
         .await
-        .map_err(|error| TradingError::Exchange(error.to_string()))?;
+        .map_err(|error| TradingError::Exchange(reqwest_error_message(error)))?;
 
     if status != StatusCode::OK {
         return Err(TradingError::Exchange(format!(
@@ -304,6 +303,10 @@ async fn decode_telegram_response(response: reqwest::Response) -> Result<Value> 
     }
 
     serde_json::from_str(&body).map_err(|error| TradingError::Exchange(error.to_string()))
+}
+
+fn reqwest_error_message(error: reqwest::Error) -> String {
+    error.without_url().to_string()
 }
 
 #[derive(Debug, Deserialize)]

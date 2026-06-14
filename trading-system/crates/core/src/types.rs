@@ -67,9 +67,10 @@ impl fmt::Display for Symbol {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TradingMode {
+    #[default]
     Paper,
     Testnet,
     Live,
@@ -84,12 +85,6 @@ impl TradingMode {
             Self::Live => "live",
             Self::Locked => "locked",
         }
-    }
-}
-
-impl Default for TradingMode {
-    fn default() -> Self {
-        Self::Paper
     }
 }
 

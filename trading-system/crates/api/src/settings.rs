@@ -118,8 +118,18 @@ impl Settings {
                 .context("PAPER_MAX_CANDLES_PER_KEY must be a valid usize")?,
         };
 
+        ensure_positive_decimal("PAPER_EQUITY", paper_trading.equity)?;
+        ensure_positive_decimal("PAPER_DAILY_LOSS_LIMIT", paper_trading.daily_loss_limit)?;
+        if paper_trading.max_candles_per_key == 0 {
+            bail!("PAPER_MAX_CANDLES_PER_KEY must be greater than zero");
+        }
+
         if paper_trading.enabled && !market_data.enabled {
             bail!("PAPER_TRADING_ENABLED=true requires MARKET_DATA_ENABLED=true");
+        }
+
+        if paper_trading.enabled && trading.mode != TradingMode::Paper {
+            bail!("PAPER_TRADING_ENABLED=true requires TRADING_MODE=paper");
         }
 
         if trading.mode == TradingMode::Testnet && !market_data.enabled {
@@ -146,6 +156,11 @@ impl Settings {
             ))?,
         };
 
+        ensure_positive_decimal(
+            "BINANCE_TESTNET_MAX_ORDER_NOTIONAL",
+            binance_testnet.max_order_notional,
+        )?;
+
         if trading.mode == TradingMode::Testnet && !binance_testnet.enabled {
             bail!("TRADING_MODE=testnet requires BINANCE_TESTNET_ENABLED=true");
         }
@@ -171,12 +186,18 @@ impl Settings {
             bail!("TELEGRAM_ALLOWED_CHAT_ID is required when TELEGRAM_ENABLED=true");
         }
 
+        let api_host = env_value("API_HOST", "127.0.0.1");
+        let dashboard_control_token = optional_env_value("DASHBOARD_CONTROL_TOKEN");
+        if !is_loopback_bind_host(&api_host) && dashboard_control_token.is_none() {
+            bail!("DASHBOARD_CONTROL_TOKEN is required when API_HOST is not loopback");
+        }
+
         Ok(Self {
-            api_host: env_value("API_HOST", "127.0.0.1"),
+            api_host,
             api_port: env_value("API_PORT", "8080")
                 .parse()
                 .context("API_PORT must be a valid u16")?,
-            dashboard_control_token: optional_env_value("DASHBOARD_CONTROL_TOKEN"),
+            dashboard_control_token,
             database: DatabaseSettings {
                 url: env::var("DATABASE_URL").context("DATABASE_URL is required")?,
                 max_connections: env_value("DATABASE_MAX_CONNECTIONS", "5")
@@ -253,6 +274,13 @@ fn parse_decimal(value: &str) -> anyhow::Result<Decimal> {
         .with_context(|| format!("invalid decimal value: {value}"))
 }
 
+fn ensure_positive_decimal(key: &str, value: Decimal) -> anyhow::Result<()> {
+    if value <= Decimal::ZERO {
+        bail!("{key} must be greater than zero");
+    }
+    Ok(())
+}
+
 fn parse_mode(value: &str) -> anyhow::Result<TradingMode> {
     match value.to_ascii_lowercase().as_str() {
         "paper" => Ok(TradingMode::Paper),
@@ -261,6 +289,16 @@ fn parse_mode(value: &str) -> anyhow::Result<TradingMode> {
         "locked" => Ok(TradingMode::Locked),
         _ => bail!("TRADING_MODE must be paper, testnet, live, or locked"),
     }
+}
+
+fn is_loopback_bind_host(host: &str) -> bool {
+    let normalized = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+
+    normalized == "localhost" || normalized == "::1" || normalized.starts_with("127.")
 }
 
 #[cfg(test)]
@@ -297,5 +335,22 @@ mod tests {
     #[test]
     fn decimal_parser_accepts_plain_numbers() {
         assert_eq!(parse_decimal("10000").unwrap(), Decimal::new(10_000, 0));
+    }
+
+    #[test]
+    fn positive_decimal_validator_rejects_zero_and_negative_values() {
+        assert!(ensure_positive_decimal("TEST", Decimal::ONE).is_ok());
+        assert!(ensure_positive_decimal("TEST", Decimal::ZERO).is_err());
+        assert!(ensure_positive_decimal("TEST", Decimal::new(-1, 0)).is_err());
+    }
+
+    #[test]
+    fn loopback_bind_host_allows_local_auth_defaults_only() {
+        assert!(is_loopback_bind_host("127.0.0.1"));
+        assert!(is_loopback_bind_host("127.0.0.2"));
+        assert!(is_loopback_bind_host("localhost"));
+        assert!(is_loopback_bind_host("[::1]"));
+        assert!(!is_loopback_bind_host("0.0.0.0"));
+        assert!(!is_loopback_bind_host("192.168.0.10"));
     }
 }

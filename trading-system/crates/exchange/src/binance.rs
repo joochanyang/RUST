@@ -44,7 +44,7 @@ fn http_client() -> Client {
 impl Default for BinanceAdapter {
     fn default() -> Self {
         Self {
-            ws_base_url: "wss://stream.binancefuture.com".to_owned(),
+            ws_base_url: "wss://fstream.binance.com".to_owned(),
             rest_base_url: "https://fapi.binance.com".to_owned(),
             api_key: None,
             api_secret: None,
@@ -102,12 +102,56 @@ impl ExchangeAdapter for BinanceAdapter {
         &self,
         request: ProtectionOrderRequest,
     ) -> Result<ProtectionAck> {
-        let stop_loss = self
+        let stop_loss = match self
             .post_signed(ALGO_ORDER_PATH, stop_loss_algo_params(&request))
-            .await?;
-        let take_profit = self
+            .await
+        {
+            Ok(stop_loss) => stop_loss,
+            Err(error) => {
+                let cancel_summary = if matches!(error, TradingError::Timeout(_)) {
+                    Some(
+                        self.cancel_algo_candidates(
+                            "stop-loss",
+                            vec![request.stop_loss_client_algo_id.clone()],
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
+                return Err(protection_failure_error("stop-loss", error, cancel_summary));
+            }
+        };
+        let take_profit = match self
             .post_signed(ALGO_ORDER_PATH, take_profit_algo_params(&request))
-            .await?;
+            .await
+        {
+            Ok(take_profit) => take_profit,
+            Err(error) => {
+                let mut cancel_summaries = vec![
+                    self.cancel_algo_candidates(
+                        "stop-loss",
+                        protection_cancel_candidates(&request.stop_loss_client_algo_id, &stop_loss),
+                    )
+                    .await,
+                ];
+                if matches!(error, TradingError::Timeout(_)) {
+                    cancel_summaries.push(
+                        self.cancel_algo_candidates(
+                            "take-profit",
+                            vec![request.take_profit_client_algo_id.clone()],
+                        )
+                        .await,
+                    );
+                }
+
+                return Err(protection_failure_error(
+                    "take-profit",
+                    error,
+                    Some(cancel_summaries.join("; ")),
+                ));
+            }
+        };
 
         Ok(ProtectionAck {
             stop_loss_order_id: order_id_from_value(&stop_loss),
@@ -116,10 +160,11 @@ impl ExchangeAdapter for BinanceAdapter {
         })
     }
 
-    async fn cancel_order(&self, _order_id: String) -> Result<CancelAck> {
-        Err(TradingError::Exchange(
-            "Binance cancel order is not implemented yet".to_owned(),
-        ))
+    async fn cancel_order(&self, order_id: String) -> Result<CancelAck> {
+        let raw = self
+            .delete_signed(ALGO_ORDER_PATH, cancel_algo_order_params(&order_id))
+            .await?;
+        Ok(CancelAck { raw })
     }
 
     async fn query_order(
@@ -164,7 +209,7 @@ impl BinanceAdapter {
             .get(url)
             .send()
             .await
-            .map_err(|error| TradingError::Exchange(error.to_string()))?;
+            .map_err(|error| TradingError::Exchange(reqwest_error_message(error)))?;
         let raw = decode_binance_response(response).await?;
 
         Ok(parse_symbol_filters(&raw, symbols))
@@ -186,11 +231,13 @@ impl BinanceAdapter {
         let mut urls = Vec::with_capacity(2);
 
         if !kline_streams.is_empty() {
-            urls.push(format!("{base}/stream?streams={kline_streams}"));
+            urls.push(format!("{base}/market/stream?streams={kline_streams}"));
         }
 
         if !book_ticker_streams.is_empty() {
-            urls.push(format!("{base}/stream?streams={book_ticker_streams}"));
+            urls.push(format!(
+                "{base}/public/stream?streams={book_ticker_streams}"
+            ));
         }
 
         urls
@@ -224,6 +271,43 @@ impl BinanceAdapter {
         decode_binance_response(response).await
     }
 
+    async fn delete_signed(&self, path: &str, params: Vec<(&str, String)>) -> Result<Value> {
+        let url = self.signed_url(path, params)?;
+        let api_key = self.api_key()?;
+        let response = self
+            .client
+            .delete(url)
+            .header("X-MBX-APIKEY", api_key)
+            .send()
+            .await
+            .map_err(map_request_error)?;
+
+        decode_binance_response(response).await
+    }
+
+    async fn cancel_algo_candidates(&self, label: &str, candidates: Vec<Option<String>>) -> String {
+        let mut ids = Vec::new();
+        for candidate in candidates.into_iter().flatten() {
+            if !candidate.is_empty() && !ids.contains(&candidate) {
+                ids.push(candidate);
+            }
+        }
+
+        if ids.is_empty() {
+            return format!("{label} cancel skipped: no algo id");
+        }
+
+        let mut errors = Vec::new();
+        for id in ids {
+            match self.cancel_order(id.clone()).await {
+                Ok(_) => return format!("{label} cancel ok via {id}"),
+                Err(error) => errors.push(format!("{id}: {error}")),
+            }
+        }
+
+        format!("{label} cancel failed ({})", errors.join(", "))
+    }
+
     fn signed_url(&self, path: &str, mut params: Vec<(&str, String)>) -> Result<String> {
         let secret = self.api_secret()?;
         params.push(("recvWindow", self.recv_window_ms.to_string()));
@@ -253,7 +337,7 @@ async fn decode_binance_response(response: reqwest::Response) -> Result<Value> {
     let body = response
         .text()
         .await
-        .map_err(|error| TradingError::Exchange(error.to_string()))?;
+        .map_err(|error| TradingError::Exchange(reqwest_error_message(error)))?;
 
     if !status.is_success() {
         return Err(TradingError::Exchange(format!(
@@ -343,6 +427,13 @@ fn order_id_from_value(value: &Value) -> Option<String> {
         })
 }
 
+fn client_algo_id_from_value(value: &Value) -> Option<String> {
+    value
+        .get("clientAlgoId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value
         .get(key)
@@ -370,10 +461,14 @@ fn binance_side(side: Side) -> &'static str {
 /// possibly-filled order as a definitive failure.
 fn map_request_error(error: reqwest::Error) -> TradingError {
     if error.is_timeout() {
-        TradingError::Timeout(error.to_string())
+        TradingError::Timeout(reqwest_error_message(error))
     } else {
-        TradingError::Exchange(error.to_string())
+        TradingError::Exchange(reqwest_error_message(error))
     }
+}
+
+fn reqwest_error_message(error: reqwest::Error) -> String {
+    error.without_url().to_string()
 }
 
 /// Builds the signed-request parameters for a market order. Extracted so the
@@ -392,11 +487,21 @@ fn protection_close_side(position_side: PositionSide) -> &'static str {
 }
 
 fn stop_loss_algo_params(request: &ProtectionOrderRequest) -> Vec<(&'static str, String)> {
-    conditional_algo_params(request, "STOP_MARKET", request.stop_loss_price)
+    conditional_algo_params(
+        request,
+        "STOP_MARKET",
+        request.stop_loss_price,
+        request.stop_loss_client_algo_id.as_deref(),
+    )
 }
 
 fn take_profit_algo_params(request: &ProtectionOrderRequest) -> Vec<(&'static str, String)> {
-    conditional_algo_params(request, "TAKE_PROFIT_MARKET", request.take_profit_price)
+    conditional_algo_params(
+        request,
+        "TAKE_PROFIT_MARKET",
+        request.take_profit_price,
+        request.take_profit_client_algo_id.as_deref(),
+    )
 }
 
 /// Builds the algo-order params shared by both protection legs. The algo
@@ -406,8 +511,9 @@ fn conditional_algo_params(
     request: &ProtectionOrderRequest,
     order_type: &'static str,
     trigger_price: Decimal,
+    client_algo_id: Option<&str>,
 ) -> Vec<(&'static str, String)> {
-    vec![
+    let mut params = vec![
         ("algoType", "CONDITIONAL".to_owned()),
         ("symbol", request.symbol.as_str().to_owned()),
         (
@@ -420,7 +526,43 @@ fn conditional_algo_params(
         ("reduceOnly", "true".to_owned()),
         ("workingType", "MARK_PRICE".to_owned()),
         ("newOrderRespType", "RESULT".to_owned()),
+    ];
+    if let Some(client_algo_id) = client_algo_id {
+        params.push(("clientAlgoId", client_algo_id.to_owned()));
+    }
+    params
+}
+
+fn cancel_algo_order_params(order_id: &str) -> Vec<(&'static str, String)> {
+    if order_id.chars().all(|character| character.is_ascii_digit()) {
+        vec![("algoId", order_id.to_owned())]
+    } else {
+        vec![("clientAlgoId", order_id.to_owned())]
+    }
+}
+
+fn protection_cancel_candidates(
+    client_algo_id: &Option<String>,
+    raw: &Value,
+) -> Vec<Option<String>> {
+    vec![
+        client_algo_id.clone(),
+        client_algo_id_from_value(raw),
+        order_id_from_value(raw),
     ]
+}
+
+fn protection_failure_error(
+    failed_leg: &str,
+    error: TradingError,
+    cancel_summary: Option<String>,
+) -> TradingError {
+    let mut message = format!("Binance {failed_leg} protection order failed: {error}");
+    if let Some(cancel_summary) = cancel_summary {
+        message.push_str("; compensation: ");
+        message.push_str(&cancel_summary);
+    }
+    TradingError::Exchange(message)
 }
 
 fn market_order_params(request: &MarketOrderRequest) -> Vec<(&'static str, String)> {
@@ -820,11 +962,11 @@ mod tests {
             urls,
             vec![
                 concat!(
-                    "wss://stream.binancefuture.com/stream?streams=",
+                    "wss://fstream.binance.com/market/stream?streams=",
                     "btcusdt@kline_1m/ethusdt@kline_1m"
                 ),
                 concat!(
-                    "wss://stream.binancefuture.com/stream?streams=",
+                    "wss://fstream.binance.com/public/stream?streams=",
                     "btcusdt@bookTicker/ethusdt@bookTicker"
                 ),
             ]
@@ -1107,6 +1249,8 @@ mod tests {
             quantity: Decimal::new(1, 2),
             stop_loss_price: Decimal::new(1000, 0),
             take_profit_price: Decimal::new(9000, 0),
+            stop_loss_client_algo_id: Some("entryabc-sl".to_owned()),
+            take_profit_client_algo_id: Some("entryabc-tp".to_owned()),
         }
     }
 
@@ -1122,6 +1266,7 @@ mod tests {
         assert_eq!(param(&params, "side"), Some("SELL"));
         assert_eq!(param(&params, "triggerPrice"), Some("1000"));
         assert_eq!(param(&params, "reduceOnly"), Some("true"));
+        assert_eq!(param(&params, "clientAlgoId"), Some("entryabc-sl"));
         assert_eq!(
             param(&params, "stopPrice"),
             None,
@@ -1137,7 +1282,22 @@ mod tests {
         assert_eq!(param(&params, "side"), Some("SELL"));
         assert_eq!(param(&params, "triggerPrice"), Some("9000"));
         assert_eq!(param(&params, "reduceOnly"), Some("true"));
+        assert_eq!(param(&params, "clientAlgoId"), Some("entryabc-tp"));
         assert_eq!(param(&params, "stopPrice"), None);
+    }
+
+    #[test]
+    fn cancel_algo_params_route_numeric_id_as_algo_id() {
+        let params = cancel_algo_order_params("2146760");
+        assert_eq!(param(&params, "algoId"), Some("2146760"));
+        assert_eq!(param(&params, "clientAlgoId"), None);
+    }
+
+    #[test]
+    fn cancel_algo_params_route_string_id_as_client_algo_id() {
+        let params = cancel_algo_order_params("entryabc-sl");
+        assert_eq!(param(&params, "clientAlgoId"), Some("entryabc-sl"));
+        assert_eq!(param(&params, "algoId"), None);
     }
 
     // A request through the production HTTP client must not hang forever when the
