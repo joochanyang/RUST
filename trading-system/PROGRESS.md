@@ -1,10 +1,11 @@
 # PROGRESS — trading-system (Rust 코인선물 AI 트레이딩)
 
-> 마지막 갱신: 2026-06-14. 다음 세션에서 이 파일부터 읽고 "재개 지점"으로 이동.
+> 마지막 갱신: 2026-06-14 (2차 세션). 다음 세션에서 이 파일부터 읽고 "재개 지점"으로 이동.
 
 ## 현재 상태 (한 줄)
-전체 코드리뷰 + 머니 코렉트니스 6종(C1·C2·C3·H1·H2·H3) 수정 완료, 커밋·푸시 끝.
-**테스트 59 통과/0 실패, fmt clean, clippy 신규경고 0.** 다음은 아래 "남은 후속" 중 선택.
+머니 코렉트니스 6종(C1~H3) + **후속 #1·#2·#3 + 적대적리뷰 확정결함 1건** 수정 완료.
+**테스트 67 통과/0 실패, fmt clean, clippy 13(신규 0).** DB 통합테스트 0건 skip 확인.
+다음은 아래 "남은 후속" 참조(운영확인 + 선택적 reconcile 기능).
 
 ## 위치 / 저장소
 - 작업 경로: `~/Documents/Rust/trading-system` (⚠️ git repo 루트는 **부모** `~/Documents/Rust`)
@@ -21,11 +22,18 @@
 - **H3** `main.rs`: live 모드 시작 시 `bail!` (라이브 런타임 미구현)
 - 적대적 멀티에이전트 워크플로로 2회 검증(C2 벌크경로·H1 반올림방향 결함 추가 발견·수정)
 
-## ▶ 재개 지점 — "남은 후속" (우선순위 순, 이번 범위 밖이었음)
-1. **M: HTTP 요청 타임아웃 부재** — `binance.rs` `Client::new()`에 `.timeout(10s)` 추가. 주문이 전략 루프 무한 블록 방지. (가장 쉬움·실효성 큼)
-2. **M: 멱등성 키(newClientOrderId) 부재** — `binance.rs` `place_market_order`에 `signal_id` 기반 결정적 client order id 추가. 타임아웃 재시도 시 중복주문/대사 방지
-3. **C3 end-to-end 테스트** — 보호실패 전체 시퀀스(lock→flatten→CRITICAL risk_event→alert→open_key 미등록) 통합 테스트. 현재 `flatten_position` 단위 테스트만 있음
-4. **운영 확인(코드 아님)**: `demo-fapi.binance.com`이 실제 데모/테스트넷인지 testnet 키와 함께 1회 확인 (안전모델 전체가 이 host 문자열에 의존)
+## ✅ 2차 세션 완료 (2026-06-14, 후속 #1~#3 + 확정결함)
+- **#1 HTTP 타임아웃**: `binance.rs` `http_client()` = `Client::builder().timeout(10s)`. `HTTP_REQUEST_TIMEOUT=10s` 상수. `default()`가 사용. silent-server 통합테스트로 실측(10초에 timeout)
+- **#2 멱등성 키(field-only, retry 미구현 — 사용자 결정)**: `MarketOrderRequest.client_order_id: Option<String>` 추가. `market_order_params()` 추출(서명순서 보존). 진입=`client_order_id_for_signal(signal.id)`=`uuid.to_string()`(36자·Binance-safe), 플래튼=`None`
+- **#3 C3 e2e**: 보호실패 인라인 블록을 `handle_protection_failure(...)`로 **동작보존 추출**. DB연동 e2e 테스트로 전체 시퀀스(lock→reduceOnly플래튼→CRITICAL risk_event→alert→키 미등록) 검증
+- **★확정결함(적대적리뷰 7에이전트, 1확정/3기각)**: #1 타임아웃이 기존 갭 노출 — 진입주문 타임아웃 시 Binance는 체결했는데 봇은 'Err=실패'로 보고 skip → **무방비 포지션+재진입**. #2 멱등키는 캔들마다 UUID 새로생겨 못막음
+  - **수정(보수적 락)**: `TradingError::Timeout` 변종 추가 + `map_request_error`(reqwest `is_timeout()`로 분류). 진입 Err arm에서 `Timeout`이면 `handle_entry_timeout(...)` → **런타임 LOCK + CRITICAL alert + risk_event(action=`entry_order_timeout_unknown_outcome`)**. 일반 실패는 기존대로 skip. DB e2e 테스트 추가
+  - 기각된 3건: http_client fallback(rustls는 build실패 불가), connect_timeout/WS 무타임아웃(WS는 변경무관·hang=무동작), 멱등키 UUID(오늘 무해·랜덤은 항상 수용)
+
+## ▶ 재개 지점 — "남은 후속" (우선순위 순, 이번 범위 밖)
+1. **(선택) 주문상태 reconcile — 자동복구**: 타임아웃 시 이미 보낸 `client_order_id`로 `GET /fapi/v1/order?origClientOrderId=` 조회 → 체결됐으면 보호주문 진행, 아니면 안전 skip. 현재는 보수적 LOCK만(가용성↓·안전↑). 이게 #2 멱등키의 본래 의도(자동복구). **GET order 엔드포인트 신규구현 필요**
+2. **운영 확인(코드 아님)**: `demo-fapi.binance.com`이 실제 데모/테스트넷인지 testnet 키와 함께 1회 확인 (안전모델 전체가 이 host 문자열에 의존)
+3. **(선택) signal.id 안정화**: `strategy/src/lib.rs:100` `Uuid::new_v4()`가 캔들마다 새 id → 같은 시장조건 재진입은 다른 멱등키. reconcile 도입 시 영향 검토
 
 ## 🔧 다음 세션 부팅 명령어 (그대로 복붙)
 ```sh
@@ -38,7 +46,7 @@ psql "$ADMIN_URL" -tAc "SELECT 1 FROM pg_database WHERE datname='trading_system_
   || psql "$ADMIN_URL" -c "CREATE DATABASE trading_system_test;"
 export TEST_DATABASE_URL="${DATABASE_URL%/*}/trading_system_test"
 
-# 2) 그린 베이스라인 확인 (반드시 59 passed / 0 failed 여야 함)
+# 2) 그린 베이스라인 확인 (반드시 67 passed / 0 failed 여야 함)
 cargo test --workspace 2>&1 | grep -oE "[0-9]+ passed" | awk '{s+=$1} END{print s" passed"}'
 cargo fmt --all -- --check && echo "fmt clean"
 cargo clippy --workspace --all-targets 2>&1 | grep -cE "^(warning|error):"   # 13 = 기존 baseline (신규 0)
@@ -52,6 +60,8 @@ cargo clippy --workspace --all-targets 2>&1 | grep -cE "^(warning|error):"   # 1
 - **DB 통합 테스트**는 `TEST_DATABASE_URL` 없으면 조용히 skip됨. 0건 skip 확인할 것
 - 보호가격 반올림 방향: **LONG=floor, SHORT=ceil** (스탑이 entry로 안 당겨지게). `round_protection_price(price, side)`
 - 머니 코드 수정은 항상 **재현 테스트(RED) → 수정 → GREEN** + 적대적 워크플로 검증
+- **타임아웃≠실패**: 주문 HTTP 타임아웃은 결과 UNKNOWN(체결됐을 수 있음). `TradingError::Timeout`으로 분류해 진입에선 LOCK 처리. 절대 일반 실패처럼 silent skip 금지(무방비 포지션 위험). `map_request_error`(binance.rs)·`handle_entry_timeout`(testnet_runtime.rs)
+- 보호실패/타임아웃 복구는 인라인 금지 → `handle_protection_failure`·`handle_entry_timeout` 함수로(테스트 가능 seam)
 - 서브에이전트는 항상 `model: "opus"`
 
 ## 📚 핵심 문서

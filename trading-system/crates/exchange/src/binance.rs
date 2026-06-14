@@ -27,6 +27,20 @@ pub struct BinanceAdapter {
     client: Client,
 }
 
+/// Wall-clock cap on a single REST request. Bounds how long a stuck order or
+/// account call can block the strategy loop before surfacing an error.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Builds the REST client used for all signed/unsigned Binance calls with a
+/// bounded request timeout. A request must never hang the strategy loop
+/// indefinitely; falling back to `Client::new()` (no timeout) is unsafe here.
+fn http_client() -> Client {
+    Client::builder()
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
+
 impl Default for BinanceAdapter {
     fn default() -> Self {
         Self {
@@ -35,7 +49,7 @@ impl Default for BinanceAdapter {
             api_key: None,
             api_secret: None,
             recv_window_ms: 5_000,
-            client: Client::new(),
+            client: http_client(),
         }
     }
 }
@@ -78,16 +92,7 @@ impl ExchangeAdapter for BinanceAdapter {
     }
 
     async fn place_market_order(&self, request: MarketOrderRequest) -> Result<OrderAck> {
-        let mut params = vec![
-            ("symbol", request.symbol.as_str().to_owned()),
-            ("side", binance_side(request.side).to_owned()),
-            ("type", "MARKET".to_owned()),
-            ("quantity", request.quantity.to_string()),
-            ("newOrderRespType", "RESULT".to_owned()),
-        ];
-        if request.reduce_only {
-            params.push(("reduceOnly", "true".to_owned()));
-        }
+        let params = market_order_params(&request);
         let raw = self.post_signed("/fapi/v1/order", params).await?;
 
         order_ack_from_value(raw)
@@ -211,7 +216,7 @@ impl BinanceAdapter {
             .header("X-MBX-APIKEY", api_key)
             .send()
             .await
-            .map_err(|error| TradingError::Exchange(error.to_string()))?;
+            .map_err(map_request_error)?;
 
         decode_binance_response(response).await
     }
@@ -225,7 +230,7 @@ impl BinanceAdapter {
             .header("X-MBX-APIKEY", api_key)
             .send()
             .await
-            .map_err(|error| TradingError::Exchange(error.to_string()))?;
+            .map_err(map_request_error)?;
 
         decode_binance_response(response).await
     }
@@ -333,6 +338,38 @@ fn binance_side(side: Side) -> &'static str {
         Side::Buy => "BUY",
         Side::Sell => "SELL",
     }
+}
+
+/// Maps a transport-level request error to a `TradingError`, distinguishing a
+/// timeout (remote outcome unknown — the order may have executed) from a generic
+/// exchange/transport failure. Callers branch on `Timeout` to avoid treating a
+/// possibly-filled order as a definitive failure.
+fn map_request_error(error: reqwest::Error) -> TradingError {
+    if error.is_timeout() {
+        TradingError::Timeout(error.to_string())
+    } else {
+        TradingError::Exchange(error.to_string())
+    }
+}
+
+/// Builds the signed-request parameters for a market order. Extracted so the
+/// parameter wiring (reduce-only flag, optional idempotency key) is unit-testable
+/// without a network round-trip.
+fn market_order_params(request: &MarketOrderRequest) -> Vec<(&'static str, String)> {
+    let mut params = vec![
+        ("symbol", request.symbol.as_str().to_owned()),
+        ("side", binance_side(request.side).to_owned()),
+        ("type", "MARKET".to_owned()),
+        ("quantity", request.quantity.to_string()),
+        ("newOrderRespType", "RESULT".to_owned()),
+    ];
+    if request.reduce_only {
+        params.push(("reduceOnly", "true".to_owned()));
+    }
+    if let Some(client_order_id) = &request.client_order_id {
+        params.push(("newClientOrderId", client_order_id.clone()));
+    }
+    params
 }
 
 /// Per-symbol trading rules from Binance `exchangeInfo`, used to round order
@@ -908,5 +945,97 @@ mod tests {
         let all = parse_symbol_filters(&raw, &[]);
         assert_eq!(all.len(), 2);
         assert!(all.contains_key(&Symbol::new("ETHUSDT")));
+    }
+
+    fn market_request(reduce_only: bool, client_order_id: Option<&str>) -> MarketOrderRequest {
+        MarketOrderRequest {
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            quantity: Decimal::new(3, 2),
+            reduce_only,
+            client_order_id: client_order_id.map(str::to_owned),
+        }
+    }
+
+    fn param<'a>(params: &'a [(&'static str, String)], key: &str) -> Option<&'a str> {
+        params
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn market_order_params_include_client_order_id_when_present() {
+        let params = market_order_params(&market_request(false, Some("sig-abc")));
+        assert_eq!(
+            param(&params, "newClientOrderId"),
+            Some("sig-abc"),
+            "a deterministic client order id must be sent for idempotency"
+        );
+    }
+
+    #[test]
+    fn market_order_params_omit_client_order_id_when_absent() {
+        let params = market_order_params(&market_request(false, None));
+        assert_eq!(
+            param(&params, "newClientOrderId"),
+            None,
+            "no client order id field should be sent when none is provided"
+        );
+    }
+
+    #[test]
+    fn market_order_params_include_reduce_only_only_when_set() {
+        let with = market_order_params(&market_request(true, None));
+        assert_eq!(param(&with, "reduceOnly"), Some("true"));
+        let without = market_order_params(&market_request(false, None));
+        assert_eq!(param(&without, "reduceOnly"), None);
+    }
+
+    // A request through the production HTTP client must not hang forever when the
+    // server accepts the connection but never responds. Without a configured
+    // request timeout, a single stuck order would block the strategy loop
+    // indefinitely. We point the client at a local listener that accepts and then
+    // goes silent, and require the request to fail (time out) within a bound well
+    // under any default.
+    #[tokio::test]
+    async fn http_client_times_out_on_silent_server() {
+        use std::time::Instant;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept the connection and hold it open without ever replying.
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                tokio::time::sleep(Duration::from_secs(120)).await;
+            }
+        });
+
+        let client = http_client();
+        let start = Instant::now();
+        let result = client.get(format!("http://{addr}/")).send().await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a silent server must produce an error, not hang"
+        );
+        let error = result.unwrap_err();
+        assert!(error.is_timeout(), "the error must be a timeout");
+        assert!(
+            elapsed < HTTP_REQUEST_TIMEOUT + Duration::from_secs(2),
+            "request should time out near the configured bound, took {elapsed:?}"
+        );
+        // A timed-out request must be classified as Timeout, not a generic
+        // Exchange error: the caller treats the order outcome as UNKNOWN (the
+        // exchange may have filled it) rather than as a definitive failure.
+        assert!(
+            matches!(map_request_error(error), TradingError::Timeout(_)),
+            "a timeout must map to TradingError::Timeout"
+        );
     }
 }

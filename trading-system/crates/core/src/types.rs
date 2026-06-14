@@ -15,6 +15,12 @@ pub enum TradingError {
     Database(String),
     #[error("exchange error: {0}")]
     Exchange(String),
+    /// A network request did not complete within its deadline. The remote
+    /// outcome is UNKNOWN — for an order this means it may have executed on the
+    /// exchange even though we never saw the response, so callers must not treat
+    /// it as a definitive failure.
+    #[error("request timed out: {0}")]
+    Timeout(String),
     #[error("risk rule blocked action: {0}")]
     RiskBlocked(String),
 }

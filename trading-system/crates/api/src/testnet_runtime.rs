@@ -226,16 +226,36 @@ pub async fn run_binance_testnet_strategy_loop(
                 continue;
             }
 
+            let client_order_id = client_order_id_for_signal(signal.id);
             let order = match adapter
                 .place_market_order(MarketOrderRequest {
                     symbol: signal.symbol.clone(),
                     side: signal.side,
                     quantity,
                     reduce_only: false,
+                    client_order_id: Some(client_order_id.clone()),
                 })
                 .await
             {
                 Ok(order) => order,
+                // A timeout means the order outcome is UNKNOWN — Binance may have
+                // filled it, leaving a naked position. Lock and escalate instead
+                // of silently skipping (which would risk a duplicate re-entry on
+                // the next candle). Definitive failures stay a plain skip.
+                Err(error @ trading_core::TradingError::Timeout(_)) => {
+                    handle_entry_timeout(
+                        &pool,
+                        &control,
+                        &notifications,
+                        &signal.symbol,
+                        signal.side,
+                        quantity,
+                        &client_order_id,
+                        &error,
+                    )
+                    .await;
+                    continue;
+                }
                 Err(error) => {
                     notify(
                         &notifications,
@@ -263,71 +283,20 @@ pub async fn run_binance_testnet_strategy_loop(
 
             if let Err(protection_error) = &protection {
                 // Protection placement failed: the market entry left a naked,
-                // unprotected position open. Lock the runtime and immediately try
-                // to flatten the position with a reduce-only market order on the
-                // opposite side, then escalate. Never report this as a successful
-                // entry and never register the position key.
-                {
-                    let mut control = control.write().await;
-                    control.mode = TradingMode::Locked;
-                    control.locked_reason =
-                        Some("Binance testnet protection order placement failed".to_owned());
-                }
-
-                // Round the flatten quantity to the lot step too, so the reduce-only
-                // order itself is not rejected for precision.
-                let flatten_quantity =
-                    filters.round_quantity(order.executed_quantity.max(quantity));
-                let flatten =
-                    flatten_position(&adapter, &signal.symbol, signal.side, flatten_quantity).await;
-
-                let (severity, action, flatten_summary) = match &flatten {
-                    Ok(ack) => (
-                        "critical",
-                        "position_flattened_after_protection_failure",
-                        format!("flattened (order {})", ack.exchange_order_id),
-                    ),
-                    Err(flatten_error) => (
-                        "critical",
-                        "naked_position_flatten_failed",
-                        format!("FLATTEN FAILED: {flatten_error}"),
-                    ),
-                };
-
-                if let Err(error) = persist_risk_event(
+                // unprotected position open. Lock the runtime, flatten it, and
+                // escalate. Never report this as a successful entry and never
+                // register the position key.
+                handle_protection_failure(
+                    &adapter,
                     &pool,
-                    severity,
-                    "binance_testnet",
-                    action,
-                    serde_json::json!({
-                        "symbol": signal.symbol.as_str(),
-                        "side": signal.side.as_str(),
-                        "quantity": quantity,
-                        "entry_order_id": order.exchange_order_id,
-                        "entry_order_status": order.status,
-                        "protection_error": protection_error.to_string(),
-                        "flatten_ok": flatten.is_ok(),
-                    }),
-                )
-                .await
-                {
-                    tracing::error!(%error, "failed to persist naked-position risk event");
-                }
-
-                tracing::error!(
-                    symbol = signal.symbol.as_str(),
-                    %protection_error,
-                    flatten_ok = flatten.is_ok(),
-                    "testnet protection failed; runtime locked and flatten attempted"
-                );
-                notify(
+                    &control,
                     &notifications,
-                    format!(
-                        "\u{1f6a8} CRITICAL: testnet protection FAILED\nsymbol: {}\nside: {}\nqty: {}\nprotection error: {protection_error}\n{flatten_summary}\nruntime LOCKED",
-                        signal.symbol.as_str(),
-                        signal.side.as_str(),
-                        quantity,
-                    ),
+                    filters,
+                    &signal.symbol,
+                    signal.side,
+                    &order,
+                    quantity,
+                    protection_error,
                 )
                 .await;
 
@@ -373,6 +342,155 @@ pub async fn run_binance_testnet_strategy_loop(
     }
 }
 
+/// Recovers from a failed protection-order placement after a market entry has
+/// already filled, leaving a naked unprotected position. Locks the runtime,
+/// flattens the position with a reduce-only opposite-side order, persists a
+/// CRITICAL risk event, and alerts. The caller must NOT register the position
+/// key afterwards. Extracted from the entry loop so the full safety sequence is
+/// testable end-to-end.
+#[allow(clippy::too_many_arguments)]
+async fn handle_protection_failure(
+    adapter: &dyn ExchangeAdapter,
+    pool: &PgPool,
+    control: &SharedRuntimeControl,
+    notifications: &Option<NotificationSender>,
+    filters: &trading_exchange::binance::SymbolFilters,
+    symbol: &trading_core::Symbol,
+    side: trading_core::Side,
+    order: &OrderAck,
+    quantity: Decimal,
+    protection_error: &trading_core::TradingError,
+) {
+    {
+        let mut control = control.write().await;
+        control.mode = TradingMode::Locked;
+        control.locked_reason =
+            Some("Binance testnet protection order placement failed".to_owned());
+    }
+
+    // Round the flatten quantity to the lot step too, so the reduce-only
+    // order itself is not rejected for precision.
+    let flatten_quantity = filters.round_quantity(order.executed_quantity.max(quantity));
+    let flatten = flatten_position(adapter, symbol, side, flatten_quantity).await;
+
+    let (severity, action, flatten_summary) = match &flatten {
+        Ok(ack) => (
+            "critical",
+            "position_flattened_after_protection_failure",
+            format!("flattened (order {})", ack.exchange_order_id),
+        ),
+        Err(flatten_error) => (
+            "critical",
+            "naked_position_flatten_failed",
+            format!("FLATTEN FAILED: {flatten_error}"),
+        ),
+    };
+
+    if let Err(error) = persist_risk_event(
+        pool,
+        severity,
+        "binance_testnet",
+        action,
+        serde_json::json!({
+            "symbol": symbol.as_str(),
+            "side": side.as_str(),
+            "quantity": quantity,
+            "entry_order_id": order.exchange_order_id,
+            "entry_order_status": order.status,
+            "protection_error": protection_error.to_string(),
+            "flatten_ok": flatten.is_ok(),
+        }),
+    )
+    .await
+    {
+        tracing::error!(%error, "failed to persist naked-position risk event");
+    }
+
+    tracing::error!(
+        symbol = symbol.as_str(),
+        %protection_error,
+        flatten_ok = flatten.is_ok(),
+        "testnet protection failed; runtime locked and flatten attempted"
+    );
+    notify(
+        notifications,
+        format!(
+            "\u{1f6a8} CRITICAL: testnet protection FAILED\nsymbol: {}\nside: {}\nqty: {}\nprotection error: {protection_error}\n{flatten_summary}\nruntime LOCKED",
+            symbol.as_str(),
+            side.as_str(),
+            quantity,
+        ),
+    )
+    .await;
+}
+
+/// Handles an entry order whose placement TIMED OUT. The outcome is unknown:
+/// the exchange may have filled the order, leaving a naked position the bot has
+/// no record of. Locks the runtime, persists a CRITICAL risk event, and alerts,
+/// so no further entry is attempted until an operator reconciles the exchange
+/// state. Definitive (non-timeout) failures must NOT use this path.
+#[allow(clippy::too_many_arguments)]
+async fn handle_entry_timeout(
+    pool: &PgPool,
+    control: &SharedRuntimeControl,
+    notifications: &Option<NotificationSender>,
+    symbol: &trading_core::Symbol,
+    side: trading_core::Side,
+    quantity: Decimal,
+    client_order_id: &str,
+    error: &trading_core::TradingError,
+) {
+    {
+        let mut control = control.write().await;
+        control.mode = TradingMode::Locked;
+        control.locked_reason =
+            Some("Binance testnet entry order timed out (outcome unknown)".to_owned());
+    }
+
+    if let Err(persist_error) = persist_risk_event(
+        pool,
+        "critical",
+        "binance_testnet",
+        "entry_order_timeout_unknown_outcome",
+        serde_json::json!({
+            "symbol": symbol.as_str(),
+            "side": side.as_str(),
+            "quantity": quantity,
+            "client_order_id": client_order_id,
+            "error": error.to_string(),
+        }),
+    )
+    .await
+    {
+        tracing::error!(%persist_error, "failed to persist entry-timeout risk event");
+    }
+
+    tracing::error!(
+        symbol = symbol.as_str(),
+        %error,
+        "entry order timed out; outcome unknown, runtime locked"
+    );
+    notify(
+        notifications,
+        format!(
+            "\u{1f6a8} CRITICAL: testnet entry order TIMED OUT (outcome unknown)\nsymbol: {}\nside: {}\nqty: {}\nthe order may have filled on the exchange — reconcile manually\nruntime LOCKED",
+            symbol.as_str(),
+            side.as_str(),
+            quantity,
+        ),
+    )
+    .await;
+}
+
+/// Derives a deterministic Binance `newClientOrderId` from a signal id. The
+/// canonical UUID string is exactly 36 chars (Binance's max) and uses only
+/// hyphens and hex digits, all within the accepted charset, so it can be sent
+/// verbatim. Determinism means a future retry of the same signal reuses the id
+/// and the exchange rejects the duplicate instead of opening a second position.
+fn client_order_id_for_signal(signal_id: uuid::Uuid) -> String {
+    signal_id.to_string()
+}
+
 /// Closes an open position with a reduce-only market order on the opposite side.
 ///
 /// `reduce_only` guarantees the order can only shrink/close the position and can
@@ -393,6 +511,8 @@ async fn flatten_position(
             side: close_side,
             quantity,
             reduce_only: true,
+            // Recovery flatten has no retry path; let the exchange assign an id.
+            client_order_id: None,
         })
         .await
 }
@@ -501,6 +621,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn client_order_id_for_signal_is_binance_safe() {
+        let coid = client_order_id_for_signal(uuid::Uuid::nil());
+        assert!(
+            coid.len() <= 36,
+            "Binance newClientOrderId max length is 36"
+        );
+        assert!(!coid.is_empty());
+        assert!(
+            coid.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '/' | '_' | '-')),
+            "must only use Binance-accepted characters: {coid}"
+        );
+    }
+
+    #[test]
+    fn client_order_id_for_signal_is_deterministic() {
+        let id = uuid::Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
+        assert_eq!(
+            client_order_id_for_signal(id),
+            client_order_id_for_signal(id),
+            "same signal id must yield the same client order id for idempotency"
+        );
+    }
+
     #[tokio::test]
     async fn flatten_sends_reduce_only_opposite_side_order() {
         let adapter = RecordingAdapter::default();
@@ -540,5 +685,186 @@ mod tests {
         let result =
             flatten_position(&adapter, &Symbol::new("BTCUSDT"), Side::Buy, Decimal::ONE).await;
         assert!(result.is_err(), "a rejected flatten must surface an error");
+    }
+
+    fn order_ack(symbol: &str, side: Side, qty: Decimal) -> OrderAck {
+        OrderAck {
+            exchange_order_id: "entry-1".to_owned(),
+            symbol: Symbol::new(symbol),
+            side,
+            status: "FILLED".to_owned(),
+            average_price: None,
+            executed_quantity: qty,
+            raw: serde_json::Value::Null,
+        }
+    }
+
+    // End-to-end check of the C3 protection-failure recovery sequence: when a
+    // market entry fills but its protection orders fail, the runtime must (1) lock,
+    // (2) flatten with a reduce-only opposite-side order, (3) persist a CRITICAL
+    // risk event, (4) alert, and (5) NOT register the position key. This is the
+    // money-safety path that turns a naked unprotected position into a closed one.
+    #[tokio::test]
+    async fn protection_failure_locks_flattens_alerts_and_persists_critical_event() {
+        use sqlx::{postgres::PgPoolOptions, Row};
+
+        let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipping DB integration test; TEST_DATABASE_URL is not set");
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect test database");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+
+        let adapter = RecordingAdapter::default();
+        let control: SharedRuntimeControl = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::dashboard_api::RuntimeControlState::new(TradingMode::Testnet),
+        ));
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        // Zero increments leave the flatten quantity unchanged (round is identity).
+        let filters = trading_exchange::binance::SymbolFilters {
+            step_size: Decimal::ZERO,
+            tick_size: Decimal::ZERO,
+            min_qty: Decimal::ZERO,
+            min_notional: Decimal::ZERO,
+        };
+        let symbol = Symbol::new("BTCUSDT");
+        let quantity = Decimal::new(3, 2);
+        let entry = order_ack("BTCUSDT", Side::Buy, quantity);
+        // Marker to find exactly this test's risk event back out of the table.
+        let marker_order_id = format!("e2e-{}", uuid::Uuid::new_v4());
+
+        handle_protection_failure(
+            &adapter,
+            &pool,
+            &control,
+            &Some(tx),
+            &filters,
+            &symbol,
+            Side::Buy,
+            &OrderAck {
+                exchange_order_id: marker_order_id.clone(),
+                ..entry
+            },
+            quantity,
+            &TradingError::Exchange("stop-loss rejected".to_owned()),
+        )
+        .await;
+
+        // (1) runtime locked with a reason.
+        {
+            let control = control.read().await;
+            assert_eq!(control.mode, TradingMode::Locked, "runtime must be locked");
+            assert!(control.locked_reason.is_some(), "lock must record a reason");
+        }
+
+        // (2) flatten was a reduce-only order on the opposite (sell) side.
+        let flatten = adapter.last_market_order.lock().unwrap().clone().unwrap();
+        assert_eq!(flatten.side, Side::Sell, "must close the long with a sell");
+        assert!(flatten.reduce_only, "flatten must be reduce-only");
+
+        // (4) a CRITICAL alert was sent.
+        let alert = rx.try_recv().expect("an alert must be sent");
+        assert!(
+            alert.contains("CRITICAL"),
+            "alert must be flagged critical: {alert}"
+        );
+
+        // (3) a CRITICAL risk event was persisted for this entry.
+        let row = sqlx::query(
+            "SELECT severity, action FROM risk_events \
+             WHERE details->>'entry_order_id' = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&marker_order_id)
+        .fetch_one(&pool)
+        .await
+        .expect("a risk event must be persisted");
+        let severity: String = row.get("severity");
+        let action: String = row.get("action");
+        assert_eq!(severity, "critical", "risk event must be critical");
+        assert_eq!(
+            action, "position_flattened_after_protection_failure",
+            "successful flatten must record the flattened action"
+        );
+    }
+
+    // When an entry order TIMES OUT, the outcome is unknown: Binance may have
+    // filled it, leaving a naked position the bot can't see. The conservative
+    // response is to lock the runtime, alert CRITICAL, and persist a risk event,
+    // so no new entry is placed until an operator reconciles. (A definitive
+    // non-timeout failure must NOT lock — that path stays a plain skip.)
+    #[tokio::test]
+    async fn entry_timeout_locks_runtime_and_persists_critical_event() {
+        use sqlx::{postgres::PgPoolOptions, Row};
+
+        let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipping DB integration test; TEST_DATABASE_URL is not set");
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect test database");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+
+        let control: SharedRuntimeControl = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::dashboard_api::RuntimeControlState::new(TradingMode::Testnet),
+        ));
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let marker = format!("e2e-timeout-{}", uuid::Uuid::new_v4());
+
+        handle_entry_timeout(
+            &pool,
+            &control,
+            &Some(tx),
+            &Symbol::new("BTCUSDT"),
+            Side::Buy,
+            Decimal::new(3, 2),
+            &marker,
+            &TradingError::Timeout("request timed out".to_owned()),
+        )
+        .await;
+
+        // runtime locked.
+        {
+            let control = control.read().await;
+            assert_eq!(
+                control.mode,
+                TradingMode::Locked,
+                "an ambiguous timeout must lock the runtime"
+            );
+            assert!(control.locked_reason.is_some());
+        }
+
+        // CRITICAL alert sent.
+        let alert = rx.try_recv().expect("an alert must be sent");
+        assert!(
+            alert.contains("CRITICAL"),
+            "alert must be critical: {alert}"
+        );
+
+        // CRITICAL risk event persisted with the unknown-outcome action.
+        let row = sqlx::query(
+            "SELECT severity, action FROM risk_events \
+             WHERE details->>'client_order_id' = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&marker)
+        .fetch_one(&pool)
+        .await
+        .expect("a risk event must be persisted");
+        let severity: String = row.get("severity");
+        let action: String = row.get("action");
+        assert_eq!(severity, "critical");
+        assert_eq!(action, "entry_order_timeout_unknown_outcome");
     }
 }

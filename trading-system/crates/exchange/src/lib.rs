@@ -39,6 +39,12 @@ pub struct MarketOrderRequest {
     /// never open or flip into a new one. Used to flatten a position safely after
     /// a protection-order failure.
     pub reduce_only: bool,
+    /// Optional deterministic client order id (Binance `newClientOrderId`).
+    /// When set, the exchange rejects a second order with the same id, so a
+    /// future retry that reuses it cannot create a duplicate position. `None`
+    /// lets the exchange assign one. Must be Binance-safe (<=36 chars, charset
+    /// `[.A-Za-z0-9:/_-]`); the caller is responsible for producing a valid id.
+    pub client_order_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
