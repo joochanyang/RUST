@@ -1,0 +1,958 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>코인 선물 AI 하이브리드 트레이딩 시스템 최종 구현계획서</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-soft: #f0f4f8;
+      --text: #1d252f;
+      --muted: #667085;
+      --line: #d8dee8;
+      --brand: #0f766e;
+      --brand-dark: #115e59;
+      --accent: #2563eb;
+      --warn: #b45309;
+      --danger: #b91c1c;
+      --ok: #15803d;
+      --code: #111827;
+      --shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", "Apple SD Gothic Neo", Arial, sans-serif;
+      line-height: 1.65;
+    }
+
+    header {
+      background: #10201f;
+      color: #f8fafc;
+      padding: 44px 24px 36px;
+      border-bottom: 6px solid var(--brand);
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 28px auto 64px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      line-height: 1.25;
+      letter-spacing: 0;
+      margin: 0;
+    }
+
+    h1 {
+      max-width: 1040px;
+      margin: 0 auto 14px;
+      font-size: clamp(30px, 5vw, 52px);
+      font-weight: 800;
+    }
+
+    h2 {
+      font-size: 25px;
+      margin-bottom: 18px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h3 {
+      font-size: 19px;
+      margin: 22px 0 10px;
+    }
+
+    p {
+      margin: 0 0 12px;
+    }
+
+    ul,
+    ol {
+      margin: 10px 0 0 22px;
+      padding: 0;
+    }
+
+    li {
+      margin: 6px 0;
+    }
+
+    code,
+    pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    code {
+      background: #e8eef6;
+      color: #172033;
+      border-radius: 5px;
+      padding: 2px 6px;
+      font-size: 0.92em;
+    }
+
+    pre {
+      margin: 12px 0 0;
+      padding: 18px;
+      overflow-x: auto;
+      background: var(--code);
+      color: #d1e7ff;
+      border-radius: 8px;
+      line-height: 1.55;
+      font-size: 13px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 14px;
+      background: var(--panel);
+    }
+
+    th,
+    td {
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--panel-soft);
+      font-weight: 700;
+      color: #273142;
+    }
+
+    .header-inner {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+    }
+
+    .subtitle {
+      max-width: 980px;
+      margin: 0;
+      color: #cbd5e1;
+      font-size: 18px;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 22px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      background: rgba(255, 255, 255, 0.08);
+      color: #f8fafc;
+      font-size: 13px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .tag.required {
+      background: #dcfce7;
+      color: var(--ok);
+    }
+
+    .tag.gate {
+      background: #dbeafe;
+      color: var(--accent);
+    }
+
+    .tag.warning {
+      background: #fef3c7;
+      color: var(--warn);
+    }
+
+    .tag.danger {
+      background: #fee2e2;
+      color: var(--danger);
+    }
+
+    .section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 26px;
+      margin-bottom: 22px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 16px;
+    }
+
+    .card {
+      grid-column: span 4;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+      background: #fbfcfe;
+    }
+
+    .card.wide {
+      grid-column: span 6;
+    }
+
+    .card.full {
+      grid-column: 1 / -1;
+    }
+
+    .card h3 {
+      margin-top: 0;
+    }
+
+    .note {
+      border-left: 4px solid var(--brand);
+      background: #ecfdf5;
+      padding: 14px 16px;
+      border-radius: 0 8px 8px 0;
+      margin: 14px 0;
+    }
+
+    .warning-box {
+      border-left: 4px solid var(--danger);
+      background: #fff1f2;
+      padding: 14px 16px;
+      border-radius: 0 8px 8px 0;
+      margin: 14px 0;
+    }
+
+    .diagram {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+      margin-top: 14px;
+    }
+
+    .diagram-step {
+      min-height: 150px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-top: 5px solid var(--brand);
+      border-radius: 8px;
+      background: #fbfcfe;
+    }
+
+    .timeline {
+      display: grid;
+      gap: 14px;
+    }
+
+    .phase {
+      display: grid;
+      grid-template-columns: 130px 1fr;
+      gap: 18px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfe;
+    }
+
+    .phase-label {
+      color: var(--brand-dark);
+      font-weight: 900;
+      font-size: 16px;
+    }
+
+    .checklist {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px;
+      margin-top: 10px;
+    }
+
+    .check {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      background: #fbfcfe;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .toc {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .toc a {
+      color: var(--brand-dark);
+      text-decoration: none;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 6px 10px;
+      background: #fbfcfe;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .toc a:hover {
+      border-color: var(--brand);
+    }
+
+    footer {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto 44px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 860px) {
+      header {
+        padding: 32px 18px;
+      }
+
+      main {
+        width: calc(100% - 20px);
+      }
+
+      .section {
+        padding: 18px;
+      }
+
+      .card,
+      .card.wide {
+        grid-column: 1 / -1;
+      }
+
+      .diagram {
+        grid-template-columns: 1fr;
+      }
+
+      .phase {
+        grid-template-columns: 1fr;
+      }
+
+      .checklist {
+        grid-template-columns: 1fr;
+      }
+
+      table {
+        display: block;
+        overflow-x: auto;
+        white-space: nowrap;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <h1>코인 선물 AI 하이브리드 트레이딩 시스템 최종 구현계획서</h1>
+      <p class="subtitle">Rust 기반 초고속 실행 엔진, Claude 거시 전략 필터, Candle 로컬 패턴 필터, PostgreSQL 보존 레이어, Next.js 관제 대시보드를 결합한 멀티 거래소 선물 자동매매 시스템 구현 명세입니다.</p>
+      <div class="meta" aria-label="문서 메타 정보">
+        <span class="badge">Version 1.1</span>
+        <span class="badge">작성일 2026-06-12</span>
+        <span class="badge">범위 Binance USDT-M · Bybit · Bitget</span>
+        <span class="badge">출시 정책 Paper-first</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="section" id="summary">
+      <h2>0. 실행 요약</h2>
+      <div class="grid">
+        <article class="card">
+          <h3>목표</h3>
+          <p>거래소별 웹소켓 데이터 수집, AI 필터링, 리스크 제한, OCO 주문 예약, 실시간 관제를 하나의 운영 가능한 시스템으로 구축합니다.</p>
+        </article>
+        <article class="card">
+          <h3>핵심 원칙</h3>
+          <p>실거래보다 검증을 먼저 수행합니다. 모든 주문 경로는 기본적으로 <code>paper</code> 모드에서 동작하고, 명시적 승인 후에만 <code>live</code> 모드로 전환됩니다.</p>
+        </article>
+        <article class="card">
+          <h3>거래소 범위</h3>
+          <p>v1은 Binance USDT-M, Bybit USDT Perpetual, Bitget USDT Futures를 지원하며 공통 어댑터 인터페이스로 분리합니다.</p>
+        </article>
+      </div>
+      <div class="note">
+        <strong>구현 기준:</strong> 본 문서는 신규 Rust workspace를 생성해 바로 구현할 수 있도록 모듈, DB, API, 테스트, 운영 게이트를 결정한 최종 작업계획서입니다. 실제 API 키, 계좌 정보, 서버 접속 정보는 포함하지 않습니다.
+      </div>
+    </section>
+
+    <section class="section" id="toc">
+      <h2>목차</h2>
+      <nav class="toc" aria-label="문서 목차">
+        <a href="#architecture">아키텍처</a>
+        <a href="#workspace">Rust 구조</a>
+        <a href="#exchange">거래소 어댑터</a>
+        <a href="#database">PostgreSQL</a>
+        <a href="#execution">주문·리스크</a>
+        <a href="#ai">AI 필터</a>
+        <a href="#dashboard">대시보드</a>
+        <a href="#roadmap">로드맵</a>
+        <a href="#tests">테스트</a>
+        <a href="#ops">운영·보안</a>
+      </nav>
+    </section>
+
+    <section class="section" id="architecture">
+      <h2>1. 전체 아키텍처</h2>
+      <p>시스템은 비용이 큰 AI 판단을 상위 필터로 제한하고, 빠른 시장 데이터 처리와 주문 실행은 Rust 이벤트 파이프라인이 담당합니다.</p>
+      <div class="diagram">
+        <div class="diagram-step">
+          <h3>Layer 1 · Macro Brain</h3>
+          <p><code>Claude API</code>가 거시 뉴스, 주요 지표, 시장 감성을 점수화합니다.</p>
+          <p><span class="tag gate">GATE</span> 점수 범위 <code>-100..100</code>, 극단 악재 시 신규 진입 차단.</p>
+        </div>
+        <div class="diagram-step">
+          <h3>Layer 2 · Local AI Filter</h3>
+          <p><code>Candle</code> 기반 로컬 패턴 매칭이 15m, 1h 차트와 과거 유사 구간을 비교합니다.</p>
+          <p><span class="tag required">필수</span> 매칭 승률 65% 이하이면 <code>State::Locked</code>.</p>
+        </div>
+        <div class="diagram-step">
+          <h3>Layer 3 · Execution Hand</h3>
+          <p><code>Tokio</code>, <code>Axum</code>, <code>SQLx</code> 기반 Rust 엔진이 가격 수집, 신호 평가, 주문 예약을 수행합니다.</p>
+          <p><span class="tag warning">주의</span> 실거래는 <code>TRADING_MODE=live</code>와 승인 토큰이 모두 필요.</p>
+        </div>
+      </div>
+      <pre><code>[Exchange WS/REST]
+ Binance USDT-M ┐
+ Bybit          ├─&gt; exchange adapters ─&gt; market event bus ─&gt; strategy/risk ─&gt; execution router
+ Bitget         ┘              │                  │                 │             │
+                                ▼                  ▼                 ▼             ▼
+                          PostgreSQL        Candle matcher     Claude filter   Paper/Live broker
+                                │                                    │             │
+                                └────────────── Axum API / WS ───────┴───── Next.js dashboard</code></pre>
+    </section>
+
+    <section class="section" id="workspace">
+      <h2>2. Rust Workspace 구현 구조</h2>
+      <p>모듈 경계는 거래소 의존성, 전략 판단, 주문 실행, 리스크 정책을 분리하는 것을 기준으로 합니다.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Crate / 패키지</th>
+            <th>역할</th>
+            <th>핵심 책임</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>core</code></td>
+            <td>공통 타입</td>
+            <td><code>Symbol</code>, <code>MarketEvent</code>, <code>Signal</code>, <code>Order</code>, <code>Position</code>, 에러 타입 정의</td>
+          </tr>
+          <tr>
+            <td><code>exchange</code></td>
+            <td>거래소 연결</td>
+            <td><code>ExchangeAdapter</code> trait, Binance/Bybit/Bitget REST·WebSocket 구현, 서명, 레이트 리밋</td>
+          </tr>
+          <tr>
+            <td><code>strategy</code></td>
+            <td>기술 전략</td>
+            <td>RSI, Bollinger Band, 추세 필터, 신호 생성, Candle 패턴 점수 반영</td>
+          </tr>
+          <tr>
+            <td><code>risk</code></td>
+            <td>위험 제한</td>
+            <td>레버리지, 포지션 크기, 일 손실 한도, 신규 진입 잠금, 킬스위치</td>
+          </tr>
+          <tr>
+            <td><code>execution</code></td>
+            <td>주문 라우팅</td>
+            <td>Paper broker, Live broker, OCO/TP/SL 예약, 주문 상태 동기화</td>
+          </tr>
+          <tr>
+            <td><code>ai</code></td>
+            <td>AI 판단</td>
+            <td>Claude 거시 점수, Candle 로컬 유사 패턴 검색, AI 결정 로그 저장</td>
+          </tr>
+          <tr>
+            <td><code>api</code></td>
+            <td>운영 API</td>
+            <td>Axum REST/WS, 대시보드 데이터, 긴급 정지, 설정 조회</td>
+          </tr>
+          <tr>
+            <td><code>dashboard</code></td>
+            <td>관제 UI</td>
+            <td>Next.js, Tailwind, 실시간 PNL, 포지션, AI 위험도, 운영 버튼</td>
+          </tr>
+        </tbody>
+      </table>
+      <h3>권장 디렉터리</h3>
+      <pre><code>trading-system/
+  Cargo.toml
+  crates/
+    core/
+    exchange/
+      src/binance/
+      src/bybit/
+      src/bitget/
+    strategy/
+    risk/
+    execution/
+    ai/
+    api/
+  dashboard/
+  migrations/
+  configs/
+  docs/</code></pre>
+    </section>
+
+    <section class="section" id="exchange">
+      <h2>3. 멀티 거래소 어댑터 설계</h2>
+      <p>거래소별 REST, WebSocket, OCO 지원 방식이 다르므로 공통 trait를 먼저 고정하고, 구현체가 거래소별 차이를 내부에서 흡수합니다.</p>
+      <pre><code>#[async_trait]
+pub trait ExchangeAdapter: Send + Sync {
+    fn exchange_id(&self) -&gt; ExchangeId;
+    async fn subscribe_market_stream(&self, symbols: &[Symbol]) -&gt; Result&lt;MarketStream&gt;;
+    async fn fetch_account_snapshot(&self) -&gt; Result&lt;AccountSnapshot&gt;;
+    async fn place_market_order(&self, request: MarketOrderRequest) -&gt; Result&lt;OrderAck&gt;;
+    async fn place_protection_orders(&self, request: ProtectionOrderRequest) -&gt; Result&lt;ProtectionAck&gt;;
+    async fn cancel_order(&self, order_id: ExchangeOrderId) -&gt; Result&lt;CancelAck&gt;;
+}</code></pre>
+      <table>
+        <thead>
+          <tr>
+            <th>거래소</th>
+            <th>v1 지원</th>
+            <th>구현 주의점</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Binance USDT-M</td>
+            <td>BTCUSDT, ETHUSDT 우선</td>
+            <td>서명 쿼리, listen key 갱신, 주문 레이트 리밋, futures endpoint 분리</td>
+          </tr>
+          <tr>
+            <td>Bybit</td>
+            <td>USDT Perpetual</td>
+            <td>category 파라미터, TP/SL 설정 API 차이, WebSocket topic 표준화</td>
+          </tr>
+          <tr>
+            <td>Bitget</td>
+            <td>USDT Futures</td>
+            <td>productType, marginCoin, plan order 계열 API 검증, 주문 ID 매핑</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="warning-box">
+        <strong>필수 정책:</strong> v1에서는 거래소 간 동시 중복 진입을 금지합니다. 동일 심볼에 대해 하나의 거래소에서 포지션이 열려 있으면 다른 거래소의 신규 진입 신호는 무시하고 <code>risk_events</code>에 기록합니다.
+      </div>
+    </section>
+
+    <section class="section" id="database">
+      <h2>4. PostgreSQL 데이터 모델</h2>
+      <p>실시간 처리에는 메모리 이벤트 버스를 사용하고, 재현성·감사·백테스트를 위해 모든 핵심 판단과 주문 결과를 PostgreSQL에 저장합니다.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>테이블</th>
+            <th>주요 컬럼</th>
+            <th>용도</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>candles</code></td>
+            <td><code>exchange</code>, <code>symbol</code>, <code>timeframe</code>, <code>open_time</code>, <code>open</code>, <code>high</code>, <code>low</code>, <code>close</code>, <code>volume</code></td>
+            <td>전략 계산, 백테스트, 패턴 임베딩 생성</td>
+          </tr>
+          <tr>
+            <td><code>order_books</code></td>
+            <td><code>exchange</code>, <code>symbol</code>, <code>event_time</code>, <code>best_bid</code>, <code>best_ask</code>, <code>bid_size</code>, <code>ask_size</code></td>
+            <td>슬리피지 추정, 체결 환경 분석</td>
+          </tr>
+          <tr>
+            <td><code>signals</code></td>
+            <td><code>id</code>, <code>symbol</code>, <code>side</code>, <code>strategy</code>, <code>score</code>, <code>reason</code>, <code>created_at</code></td>
+            <td>전략이 만든 진입 후보 기록</td>
+          </tr>
+          <tr>
+            <td><code>orders</code></td>
+            <td><code>id</code>, <code>exchange_order_id</code>, <code>mode</code>, <code>side</code>, <code>order_type</code>, <code>status</code>, <code>price</code>, <code>quantity</code></td>
+            <td>Paper/Live 주문 상태 추적</td>
+          </tr>
+          <tr>
+            <td><code>positions</code></td>
+            <td><code>id</code>, <code>exchange</code>, <code>symbol</code>, <code>side</code>, <code>entry_price</code>, <code>mark_price</code>, <code>leverage</code>, <code>unrealized_pnl</code></td>
+            <td>포지션 현황, 청산 조건, 대시보드 표시</td>
+          </tr>
+          <tr>
+            <td><code>risk_events</code></td>
+            <td><code>id</code>, <code>severity</code>, <code>rule</code>, <code>action</code>, <code>details</code>, <code>created_at</code></td>
+            <td>진입 차단, 킬스위치, 일 손실 한도 도달 기록</td>
+          </tr>
+          <tr>
+            <td><code>ai_decisions</code></td>
+            <td><code>id</code>, <code>source</code>, <code>score</code>, <code>decision</code>, <code>model</code>, <code>input_hash</code>, <code>created_at</code></td>
+            <td>Claude/Candle 판단 감사 로그</td>
+          </tr>
+          <tr>
+            <td><code>backtest_runs</code></td>
+            <td><code>id</code>, <code>strategy_version</code>, <code>period_start</code>, <code>period_end</code>, <code>metrics</code>, <code>created_at</code></td>
+            <td>출시 게이트 검증 결과 저장</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="small">금액·수량 필드는 부동소수점 대신 <code>rust_decimal</code> 또는 정수 tick/lot 단위로 저장합니다.</p>
+    </section>
+
+    <section class="section" id="execution">
+      <h2>5. 주문 실행 및 리스크 정책</h2>
+      <div class="grid">
+        <article class="card wide">
+          <h3>기본 위험 한도</h3>
+          <ul>
+            <li>레버리지: 기본 3x, 최대 5x.</li>
+            <li>1회 진입 비중: 총 예수금의 최대 5%, 운영 승인 시 최대 10%.</li>
+            <li>손절: 진입가 기준 -1.0%.</li>
+            <li>익절: 진입가 기준 +2.0%.</li>
+            <li>손익비: 최소 1:2 미만 신호는 폐기.</li>
+          </ul>
+        </article>
+        <article class="card wide">
+          <h3>진입 게이트</h3>
+          <ul>
+            <li><span class="tag required">필수</span> WebSocket 데이터 지연 2초 이하.</li>
+            <li><span class="tag required">필수</span> Claude macro score가 금지 구간이 아님.</li>
+            <li><span class="tag required">필수</span> Candle pattern confidence 65% 초과.</li>
+            <li><span class="tag required">필수</span> 일 손실 한도와 거래소별 포지션 한도 미초과.</li>
+          </ul>
+        </article>
+      </div>
+      <h3>주문 흐름</h3>
+      <ol>
+        <li><code>strategy</code>가 신호를 생성하고 <code>risk</code>가 포지션 크기를 산출합니다.</li>
+        <li><code>execution</code>이 현재 모드가 <code>paper</code>인지 <code>live</code>인지 확인합니다.</li>
+        <li>시장가 진입 주문을 제출하거나, paper 모드에서는 체결 시뮬레이션을 수행합니다.</li>
+        <li>체결가 확정 즉시 손절과 익절 보호 주문을 예약합니다.</li>
+        <li>보호 주문 등록 실패 시 즉시 포지션 정리 또는 신규 진입 잠금을 수행합니다.</li>
+      </ol>
+      <table>
+        <thead>
+          <tr>
+            <th>모드</th>
+            <th>동작</th>
+            <th>허용 조건</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>paper</code></td>
+            <td>실제 거래소 주문 없이 호가·체결가 기반 가상 주문 생성</td>
+            <td>기본값. 개발, 백테스트, 모의매매에서 사용</td>
+          </tr>
+          <tr>
+            <td><code>live</code></td>
+            <td>거래소 REST API로 실제 주문 제출</td>
+            <td><code>TRADING_MODE=live</code>, <code>LIVE_TRADING_APPROVED=true</code>, 운영자 승인 토큰 필요</td>
+          </tr>
+          <tr>
+            <td><code>locked</code></td>
+            <td>신규 진입 차단, 기존 포지션 관리만 허용</td>
+            <td>AI 금지 신호, 킬스위치, 일 손실 한도, 데이터 지연 발생 시 자동 전환</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="section" id="ai">
+      <h2>6. AI 레이어 구현</h2>
+      <div class="grid">
+        <article class="card wide">
+          <h3>Claude Macro Filter</h3>
+          <p>하루 10~20회 이하 호출을 목표로 거시 리스크만 판단합니다. 입력은 경제 캘린더, 주요 크립토 뉴스, BTC/ETH 주요 변동성 요약으로 제한합니다.</p>
+          <ul>
+            <li>출력: <code>macro_score</code>, <code>risk_level</code>, <code>long_bias</code>, <code>short_bias</code>, <code>halt_reason</code>.</li>
+            <li>점수 -70 이하 또는 구조적 악재 판단 시 <code>State::Locked</code>.</li>
+            <li>모든 응답은 <code>ai_decisions</code>에 저장하고 입력 원문은 hash로 추적합니다.</li>
+          </ul>
+        </article>
+        <article class="card wide">
+          <h3>Candle Pattern Filter</h3>
+          <p>과거 3~5년치 15m/1h 캔들 구간을 임베딩하고 현재 패턴과 유사 구간을 검색합니다.</p>
+          <ul>
+            <li>출력: <code>pattern_confidence</code>, <code>historical_win_rate</code>, <code>similar_cases</code>.</li>
+            <li>신뢰도 65% 이하이면 진입 차단.</li>
+            <li>v1은 BTCUSDT/ETHUSDT부터 학습 데이터 품질을 검증합니다.</li>
+          </ul>
+        </article>
+      </div>
+      <div class="note">
+        <strong>비용 통제:</strong> 실시간 틱마다 외부 AI를 호출하지 않습니다. Claude는 이벤트 기반 상위 필터로만 사용하고, 실시간 매매 판단은 Rust 로컬 계산과 Candle 점수로 처리합니다.
+      </div>
+    </section>
+
+    <section class="section" id="dashboard">
+      <h2>7. Next.js 관제 대시보드</h2>
+      <p>대시보드는 매매를 설명하는 화면이 아니라 운영자가 위험 상태를 빠르게 보고 개입할 수 있는 관제 도구로 설계합니다.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>화면</th>
+            <th>필수 정보</th>
+            <th>조작</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Overview</td>
+            <td>총 잔고, 일 PNL, 현재 모드, AI 위험도, WebSocket 지연</td>
+            <td>긴급 정지, locked 전환</td>
+          </tr>
+          <tr>
+            <td>Positions</td>
+            <td>거래소, 심볼, 방향, 진입가, 수량, 레버리지, 미실현 손익, 보호 주문 상태</td>
+            <td>개별 포지션 정리 요청</td>
+          </tr>
+          <tr>
+            <td>Signals</td>
+            <td>전략 신호, AI 점수, 리스크 차단 사유, 주문 연결 상태</td>
+            <td>읽기 전용</td>
+          </tr>
+          <tr>
+            <td>Risk Events</td>
+            <td>킬스위치, 일 손실 한도, API 오류, 보호 주문 실패 이력</td>
+            <td>확인 처리</td>
+          </tr>
+          <tr>
+            <td>Settings</td>
+            <td>현재 파라미터, 거래소 활성 상태, live 전환 조건</td>
+            <td>paper/live 전환 요청, 단 관리자 승인 필요</td>
+          </tr>
+        </tbody>
+      </table>
+      <h3>백엔드 API 초안</h3>
+      <pre><code>GET  /api/health
+GET  /api/account
+GET  /api/positions
+GET  /api/signals?limit=100
+GET  /api/risk-events?limit=100
+POST /api/control/lock
+POST /api/control/unlock
+POST /api/control/panic-close
+GET  /ws/dashboard</code></pre>
+    </section>
+
+    <section class="section" id="roadmap">
+      <h2>8. 단계별 구현 로드맵</h2>
+      <div class="timeline">
+        <div class="phase">
+          <div class="phase-label">Phase 1</div>
+          <div>
+            <h3>프로젝트 기반 구축</h3>
+            <p>Rust workspace, 공통 타입, 설정 로더, 로깅, PostgreSQL migration, 기본 Axum health API를 구현합니다.</p>
+            <p><span class="tag required">완료 기준</span> 로컬에서 API 서버 기동, DB 연결, migration 실행, structured logging 확인.</p>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="phase-label">Phase 2</div>
+          <div>
+            <h3>시장 데이터 파이프라인</h3>
+            <p>Binance, Bybit, Bitget WebSocket 연결과 표준 <code>MarketEvent</code> 변환, candles/order_books 저장을 구현합니다.</p>
+            <p><span class="tag required">완료 기준</span> 3개 거래소에서 BTCUSDT 실시간 데이터 수집 및 지연/재연결 테스트 통과.</p>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="phase-label">Phase 3</div>
+          <div>
+            <h3>전략·리스크·Paper 실행</h3>
+            <p>기술 지표 신호, 리스크 게이트, paper 주문 체결 시뮬레이션, 가상 TP/SL 추적을 구현합니다.</p>
+            <p><span class="tag gate">게이트</span> 모든 주문이 기본적으로 paper 모드에 기록되고 live API 호출이 발생하지 않아야 합니다.</p>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="phase-label">Phase 4</div>
+          <div>
+            <h3>AI 필터 결합</h3>
+            <p>Claude macro score와 Candle pattern confidence를 전략 진입 게이트에 연결합니다.</p>
+            <p><span class="tag required">완료 기준</span> AI 차단 사유가 <code>signals</code>, <code>risk_events</code>, <code>ai_decisions</code>에 재현 가능하게 저장됩니다.</p>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="phase-label">Phase 5</div>
+          <div>
+            <h3>대시보드·운영 기능</h3>
+            <p>Next.js 대시보드, 실시간 WebSocket, 포지션/PNL/AI 위험도 화면, 긴급 정지 버튼을 구현합니다.</p>
+            <p><span class="tag required">완료 기준</span> 운영자가 현재 모드, 위험 상태, 포지션 보호 주문 상태를 한 화면에서 확인할 수 있습니다.</p>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="phase-label">Phase 6</div>
+          <div>
+            <h3>Live 전환 준비</h3>
+            <p>소액 실거래 전환 전 백테스트, 모의매매, 장애 주입, API 권한 검증, 킬스위치 검증을 완료합니다.</p>
+            <p><span class="tag danger">주의</span> 이 단계 전에는 실거래 API 키를 쓰지 않습니다.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="tests">
+      <h2>9. 테스트 및 승인 기준</h2>
+      <div class="checklist">
+        <div class="check">
+          <h3>단위 테스트</h3>
+          <p>지표 계산, 포지션 크기 계산, 손절/익절 가격 산출, 거래소 응답 파싱, 에러 매핑을 검증합니다.</p>
+        </div>
+        <div class="check">
+          <h3>통합 테스트</h3>
+          <p>WebSocket 이벤트 → 신호 → 리스크 게이트 → paper 주문 → DB 저장 흐름을 검증합니다.</p>
+        </div>
+        <div class="check">
+          <h3>백테스트</h3>
+          <p>최소 3년치 BTCUSDT/ETHUSDT 구간에서 수익률, MDD, 승률, 손익비, 거래 빈도를 기록합니다.</p>
+        </div>
+        <div class="check">
+          <h3>장애 주입</h3>
+          <p>네트워크 단절, 거래소 429, DB 지연, 보호 주문 실패, AI API 실패를 강제로 발생시켜 locked 전환을 확인합니다.</p>
+        </div>
+        <div class="check">
+          <h3>Paper Trading</h3>
+          <p>최소 2주 이상 실시간 모의매매를 수행하고 주문 누락, 비정상 포지션, 보호 주문 실패가 없어야 합니다.</p>
+        </div>
+        <div class="check">
+          <h3>Live 승인</h3>
+          <p>소액 계정, 출금권한 없는 API 키, 최대 레버리지 제한, 관리자 승인 토큰, 킬스위치 검증 후 제한적으로 허용합니다.</p>
+        </div>
+      </div>
+      <h3>Live 전환 체크리스트</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>항목</th>
+            <th>기준</th>
+            <th>상태</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>백테스트</td>
+            <td>전략별 결과가 <code>backtest_runs</code>에 저장되고 MDD 기준 통과</td>
+            <td><span class="tag gate">GATE</span></td>
+          </tr>
+          <tr>
+            <td>모의매매</td>
+            <td>2주 이상 paper 모드 안정 운영</td>
+            <td><span class="tag gate">GATE</span></td>
+          </tr>
+          <tr>
+            <td>API 키</td>
+            <td>출금 권한 없음, IP 제한, 선물 거래 권한만 허용</td>
+            <td><span class="tag required">필수</span></td>
+          </tr>
+          <tr>
+            <td>킬스위치</td>
+            <td>대시보드와 서버 내부 이벤트 양쪽에서 즉시 locked 전환 가능</td>
+            <td><span class="tag required">필수</span></td>
+          </tr>
+          <tr>
+            <td>레이트 리밋</td>
+            <td>거래소별 제한을 <code>governor</code>로 통제하고 429 복구 확인</td>
+            <td><span class="tag required">필수</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="section" id="ops">
+      <h2>10. 운영·보안·장애 대응</h2>
+      <div class="grid">
+        <article class="card wide">
+          <h3>보안</h3>
+          <ul>
+            <li>API 키는 <code>.env</code> 또는 secret manager로만 주입하고 Git에 저장하지 않습니다.</li>
+            <li>거래소 API 키는 출금 권한을 비활성화하고 IP allowlist를 적용합니다.</li>
+            <li>대시보드 제어 API는 관리자 인증과 CSRF 방어를 적용합니다.</li>
+          </ul>
+        </article>
+        <article class="card wide">
+          <h3>관측성</h3>
+          <ul>
+            <li><code>tracing</code>으로 주문, 리스크 차단, AI 판단, 재연결 이벤트를 구조화 로그로 남깁니다.</li>
+            <li>핵심 메트릭: WS 지연, 주문 지연, API 실패율, PNL, locked 상태 지속 시간.</li>
+            <li>장애 발생 시 <code>risk_events</code>에 운영자가 이해 가능한 사유를 저장합니다.</li>
+          </ul>
+        </article>
+        <article class="card full">
+          <h3>Fail-safe 기본값</h3>
+          <ul>
+            <li>DB 쓰기 실패가 지속되면 신규 진입을 차단합니다.</li>
+            <li>보호 주문 등록 실패 시 즉시 포지션 정리 또는 수동 개입 알림을 발생시킵니다.</li>
+            <li>WebSocket 재연결은 지수 백오프를 사용하되, 장시간 단절 시 locked 상태로 전환합니다.</li>
+            <li>Claude API 실패는 진입 허용이 아니라 보수적 차단으로 처리합니다.</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="acceptance">
+      <h2>11. 최종 산출물 정의</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>산출물</th>
+            <th>완료 조건</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Rust backend</td>
+            <td>3개 거래소 데이터 수집, paper 주문, 리스크 게이트, AI 필터, DB 저장, Axum API 작동</td>
+          </tr>
+          <tr>
+            <td>Next.js dashboard</td>
+            <td>실시간 계좌·포지션·신호·위험 이벤트 표시와 긴급 정지 기능 작동</td>
+          </tr>
+          <tr>
+            <td>Database migrations</td>
+            <td>핵심 테이블 생성과 재현 가능한 migration 실행</td>
+          </tr>
+          <tr>
+            <td>Test report</td>
+            <td>단위·통합·백테스트·paper trading 결과와 live 전환 체크리스트 기록</td>
+          </tr>
+          <tr>
+            <td>Runbook</td>
+            <td>기동, 중지, locked 해제, 장애 대응, live 전환, 롤백 절차 문서화</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer>
+    <p>본 문서는 자동매매 시스템 구현을 위한 기술 계획서이며 투자 조언이 아닙니다. 실거래 전에는 반드시 소액, 제한 권한 API 키, 충분한 모의매매 검증, 수동 감시 체계를 갖춰야 합니다.</p>
+  </footer>
+</body>
+</html>

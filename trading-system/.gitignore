@@ -1,0 +1,8 @@
+/target/
+/.env
+/.sqlx/
+*.log
+dashboard/.next/
+dashboard/node_modules/
+.DS_Store
+data/

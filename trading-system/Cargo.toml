@@ -1,0 +1,39 @@
+[workspace]
+members = [
+    "crates/ai",
+    "crates/api",
+    "crates/core",
+    "crates/exchange",
+    "crates/execution",
+    "crates/risk",
+    "crates/strategy",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+rust-version = "1.78"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["ws"] }
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+futures-core = "0.3"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rust_decimal = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["chrono", "json", "macros", "migrate", "postgres", "runtime-tokio-rustls", "rust_decimal", "uuid"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["serde", "v4"] }
