@@ -102,39 +102,11 @@ impl ExchangeAdapter for BinanceAdapter {
         &self,
         request: ProtectionOrderRequest,
     ) -> Result<ProtectionAck> {
-        let close_side = match request.position_side {
-            PositionSide::Long => "SELL",
-            PositionSide::Short => "BUY",
-        };
         let stop_loss = self
-            .post_signed(
-                "/fapi/v1/order",
-                vec![
-                    ("symbol", request.symbol.as_str().to_owned()),
-                    ("side", close_side.to_owned()),
-                    ("type", "STOP_MARKET".to_owned()),
-                    ("quantity", request.quantity.to_string()),
-                    ("stopPrice", request.stop_loss_price.to_string()),
-                    ("reduceOnly", "true".to_owned()),
-                    ("workingType", "MARK_PRICE".to_owned()),
-                    ("newOrderRespType", "RESULT".to_owned()),
-                ],
-            )
+            .post_signed(ALGO_ORDER_PATH, stop_loss_algo_params(&request))
             .await?;
         let take_profit = self
-            .post_signed(
-                "/fapi/v1/order",
-                vec![
-                    ("symbol", request.symbol.as_str().to_owned()),
-                    ("side", close_side.to_owned()),
-                    ("type", "TAKE_PROFIT_MARKET".to_owned()),
-                    ("quantity", request.quantity.to_string()),
-                    ("stopPrice", request.take_profit_price.to_string()),
-                    ("reduceOnly", "true".to_owned()),
-                    ("workingType", "MARK_PRICE".to_owned()),
-                    ("newOrderRespType", "RESULT".to_owned()),
-                ],
-            )
+            .post_signed(ALGO_ORDER_PATH, take_profit_algo_params(&request))
             .await?;
 
         Ok(ProtectionAck {
@@ -407,6 +379,50 @@ fn map_request_error(error: reqwest::Error) -> TradingError {
 /// Builds the signed-request parameters for a market order. Extracted so the
 /// parameter wiring (reduce-only flag, optional idempotency key) is unit-testable
 /// without a network round-trip.
+/// The endpoint for conditional (stop-loss / take-profit) orders. Binance moved
+/// these off `/fapi/v1/order` to the Algo service on 2025-12-09; the old path
+/// now returns -4120 for STOP_MARKET / TAKE_PROFIT_MARKET.
+const ALGO_ORDER_PATH: &str = "/fapi/v1/algoOrder";
+
+fn protection_close_side(position_side: PositionSide) -> &'static str {
+    match position_side {
+        PositionSide::Long => "SELL",
+        PositionSide::Short => "BUY",
+    }
+}
+
+fn stop_loss_algo_params(request: &ProtectionOrderRequest) -> Vec<(&'static str, String)> {
+    conditional_algo_params(request, "STOP_MARKET", request.stop_loss_price)
+}
+
+fn take_profit_algo_params(request: &ProtectionOrderRequest) -> Vec<(&'static str, String)> {
+    conditional_algo_params(request, "TAKE_PROFIT_MARKET", request.take_profit_price)
+}
+
+/// Builds the algo-order params shared by both protection legs. The algo
+/// endpoint requires `algoType=CONDITIONAL` and uses `triggerPrice` in place of
+/// the legacy `stopPrice`.
+fn conditional_algo_params(
+    request: &ProtectionOrderRequest,
+    order_type: &'static str,
+    trigger_price: Decimal,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("algoType", "CONDITIONAL".to_owned()),
+        ("symbol", request.symbol.as_str().to_owned()),
+        (
+            "side",
+            protection_close_side(request.position_side).to_owned(),
+        ),
+        ("type", order_type.to_owned()),
+        ("quantity", request.quantity.to_string()),
+        ("triggerPrice", trigger_price.to_string()),
+        ("reduceOnly", "true".to_owned()),
+        ("workingType", "MARK_PRICE".to_owned()),
+        ("newOrderRespType", "RESULT".to_owned()),
+    ]
+}
+
 fn market_order_params(request: &MarketOrderRequest) -> Vec<(&'static str, String)> {
     let mut params = vec![
         ("symbol", request.symbol.as_str().to_owned()),
@@ -1082,6 +1098,46 @@ mod tests {
         assert_eq!(param(&with, "reduceOnly"), Some("true"));
         let without = market_order_params(&market_request(false, None));
         assert_eq!(param(&without, "reduceOnly"), None);
+    }
+
+    fn protection_request() -> ProtectionOrderRequest {
+        ProtectionOrderRequest {
+            symbol: Symbol::new("ETHUSDT"),
+            position_side: PositionSide::Long,
+            quantity: Decimal::new(1, 2),
+            stop_loss_price: Decimal::new(1000, 0),
+            take_profit_price: Decimal::new(9000, 0),
+        }
+    }
+
+    // Binance migrated conditional orders (STOP_MARKET / TAKE_PROFIT_MARKET) to
+    // the Algo Order service on 2025-12-09; the old /fapi/v1/order endpoint now
+    // rejects them with -4120. The params must therefore carry algoType and use
+    // triggerPrice (not stopPrice), which is what /fapi/v1/algoOrder expects.
+    #[test]
+    fn stop_loss_algo_params_use_trigger_price_and_conditional_type() {
+        let params = stop_loss_algo_params(&protection_request());
+        assert_eq!(param(&params, "algoType"), Some("CONDITIONAL"));
+        assert_eq!(param(&params, "type"), Some("STOP_MARKET"));
+        assert_eq!(param(&params, "side"), Some("SELL"));
+        assert_eq!(param(&params, "triggerPrice"), Some("1000"));
+        assert_eq!(param(&params, "reduceOnly"), Some("true"));
+        assert_eq!(
+            param(&params, "stopPrice"),
+            None,
+            "the algo endpoint uses triggerPrice, not stopPrice"
+        );
+    }
+
+    #[test]
+    fn take_profit_algo_params_use_trigger_price_and_conditional_type() {
+        let params = take_profit_algo_params(&protection_request());
+        assert_eq!(param(&params, "algoType"), Some("CONDITIONAL"));
+        assert_eq!(param(&params, "type"), Some("TAKE_PROFIT_MARKET"));
+        assert_eq!(param(&params, "side"), Some("SELL"));
+        assert_eq!(param(&params, "triggerPrice"), Some("9000"));
+        assert_eq!(param(&params, "reduceOnly"), Some("true"));
+        assert_eq!(param(&params, "stopPrice"), None);
     }
 
     // A request through the production HTTP client must not hang forever when the
