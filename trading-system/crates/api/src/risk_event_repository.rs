@@ -3,7 +3,9 @@ use sqlx::PgPool;
 use trading_core::{ObservedMarketEvent, Result, Signal, TradingError};
 use uuid::Uuid;
 
-pub const MARKET_DATA_LATENCY_THRESHOLD_MS: i64 = 2_000;
+// Re-exported from trading-core so the ingestion warn/persist path here and the
+// entry-block site in trading-risk share one source of truth and cannot drift.
+pub use trading_core::MARKET_DATA_LATENCY_THRESHOLD_MS;
 
 pub async fn persist_ai_block_risk_event(
     pool: &PgPool,
@@ -83,7 +85,10 @@ mod tests {
     #[test]
     fn market_latency_details_include_gate_context() {
         let event_time = Utc.timestamp_opt(1_710_000_000, 0).unwrap();
-        let received_at = event_time + Duration::milliseconds(2_501);
+        // Candle freshness is now measured against close_time (open_time + 1m),
+        // so to exercise a 2_501ms latency the receive time must sit 2_501ms past
+        // the candle's close, i.e. one interval + 2_501ms past open_time.
+        let received_at = event_time + Duration::milliseconds(60_000 + 2_501);
         let observed = ObservedMarketEvent::new(
             MarketEvent::Candle(Candle {
                 exchange: ExchangeId::Binance,

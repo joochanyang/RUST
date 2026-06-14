@@ -120,7 +120,7 @@ impl RiskGate for BasicRiskGate {
             return Err(TradingError::RiskBlocked("account is locked".to_owned()));
         }
 
-        if account.market_data_latency_ms > 2_000 {
+        if account.market_data_latency_ms > trading_core::MARKET_DATA_LATENCY_THRESHOLD_MS {
             return Err(TradingError::RiskBlocked(
                 "market data latency exceeds 2 seconds".to_owned(),
             ));
@@ -231,5 +231,26 @@ mod tests {
         assert!(BasicRiskGate::default()
             .evaluate_entry(&signal(Side::Buy), Decimal::new(50_000, 0), &account)
             .is_err());
+    }
+
+    #[test]
+    fn blocks_when_latency_exceeds_threshold() {
+        let mut account = account();
+        account.market_data_latency_ms = trading_core::MARKET_DATA_LATENCY_THRESHOLD_MS + 1;
+
+        assert!(BasicRiskGate::default()
+            .evaluate_entry(&signal(Side::Buy), Decimal::new(50_000, 0), &account)
+            .is_err());
+    }
+
+    #[test]
+    fn allows_at_threshold() {
+        // The gate uses a strict `>`, so latency exactly at the threshold passes.
+        let mut account = account();
+        account.market_data_latency_ms = trading_core::MARKET_DATA_LATENCY_THRESHOLD_MS;
+
+        assert!(BasicRiskGate::default()
+            .evaluate_entry(&signal(Side::Buy), Decimal::new(50_000, 0), &account)
+            .is_ok());
     }
 }
