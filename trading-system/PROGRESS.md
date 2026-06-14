@@ -1,11 +1,13 @@
 # PROGRESS — trading-system (Rust 코인선물 AI 트레이딩)
 
-> 마지막 갱신: 2026-06-15 (runbook 정합성 수정 — paper_trading_14d 게이트 mode 스코핑 + reconcile 테스트 FK). 다음 세션에서 이 파일부터 읽고 "재개 지점"으로 이동.
+> 마지막 갱신: 2026-06-15 (출시 전 감사 P0/P1 정식 커밋 + flaky 테스트 병렬안전화 + runbook 정합성 수정). 다음 세션에서 이 파일부터 읽고 "재개 지점"으로 이동.
 
 ## 현재 상태 (한 줄)
 머니6종 + 후속 + reconcile + **latency-gate + Bitget 8h + 보호주문 Algo API + 출시 전 감사 P0/P1 + runbook 정합성 수정 완료**.
-**전체 테스트 single-threaded 0 실패, fmt clean, clippy warning 1(기존 ai_repository 인자 수).** ⚠️**병렬(`cargo test` 기본) 실행 시 `account_risk_state_counts_closed_position_without_paper_exit_as_realized`가 공유 DB 전역집계라 flaky** — 검증은 **`-- --test-threads=1`로 실행**(기존부터 그래왔음, 내 변경과 무관).
-✅ **runbook 정합성 수정 (2026-06-15)**: ①`paper_trading_14d` 게이트(라이브 해제용 머니게이트)가 runbook.md:96 명세("paper-mode" positions/protection)와 달리 `positions`/`protection_orders`를 **mode 필터 없이** 카운트 → **testnet 데이터만으로 라이브 게이트 통과 가능 결함**. `calculate_paper_trading_evidence`(`live_readiness.rs`)에 `paper_protection`/`paper_positions` CTE 추가(=`protection_orders.entry_order_id → orders.mode='paper'` 조인)로 스코핑. positions 테이블엔 mode 컬럼 없음→orders로만 추적. ②reconcile 해피패스 테스트(`testnet_runtime.rs`)가 `signal_id=nil`을 signals seed 없이 넘겨 FK위반→spurious LOCK → `run_reconcile`에 nil signal seed 추가(프로덕션은 signal 먼저 영속화하므로 정합). DB 통합테스트 3개 추가/수정, 실 PostgreSQL로 검증.
+**전체 테스트 98 통과/0 실패 (병렬 `cargo test` 반복 실행 green — flaky 해소됨), fmt clean, clippy warning 1(기존 ai_repository 인자 수).** ⚠️**DB 통합테스트는 `TEST_DATABASE_URL` 필요**(미설정 시 skip). 로컬 검증용 DB=`trading_system_test`(로컬 PG).
+✅ **출시 전 감사 P0/P1 정식 커밋 (2026-06-15, `297a9dd`)**: 이전 세션이 작업만 하고 커밋 안 했던 ~958 LOC(WS 라우팅·보호주문 partial 보상·testnet 영속화/재시작복구·testnet 리스크상태 DB화·인증 하드닝·운영가드·URL시크릿 로그차단)을 독립 검증(single-thread green·fmt·clippy·dashboard tsc) 후 커밋. `dashboard/*.tsbuildinfo` gitignore 추가.
+✅ **flaky 테스트 병렬안전화 (2026-06-15, `2e01f63`)**: `account_risk_state` 2개 테스트가 `load_account_risk_state`의 **계정 전역집계**를 단언 → 공유 DB 동시 변경으로 realized PnL 테스트가 병렬에서 flaky(-980/-990 등). **프로덕션 코드는 정상**(전역집계가 의도). 테스트를 **row-scoped**(자기 포지션의 unrealized_pnl / 자기 포지션 realized 기여를 프로덕션 SQL식으로 직접 계산)로 재작성. 병렬 `cargo test` 반복 green 확인.
+✅ **runbook 정합성 수정 (2026-06-15, `57b52f2`)**: ①`paper_trading_14d` 게이트(라이브 해제용 머니게이트)가 runbook.md:96 명세("paper-mode" positions/protection)와 달리 `positions`/`protection_orders`를 **mode 필터 없이** 카운트 → **testnet 데이터만으로 라이브 게이트 통과 가능 결함**. `calculate_paper_trading_evidence`(`live_readiness.rs`)에 `paper_protection`/`paper_positions` CTE 추가(=`protection_orders.entry_order_id → orders.mode='paper'` 조인)로 스코핑. positions 테이블엔 mode 컬럼 없음→orders로만 추적. ②reconcile 해피패스 테스트(`testnet_runtime.rs`)가 `signal_id=nil`을 signals seed 없이 넘겨 FK위반→spurious LOCK → `run_reconcile`에 nil signal seed 추가(프로덕션은 signal 먼저 영속화하므로 정합). DB 통합테스트 3개 추가/수정, 실 PostgreSQL로 검증.
 ✅ **latency-gate 해결+라이브검증**: close_time 기준 측정 → 정상 캔들 0~128ms(수정전 7-20k). **실제 진입 주문 발생 확인**(11:58 ETHUSDT).
 ✅ **Bitget 8h 해결+라이브검증**: 스냅샷 배치(500개 오래된순)에서 `.next_back()` 최신행 → 8h→0ms.
 ✅ **보호주문(SL/TP) -4120 해결+testnet 200 검증**: Binance가 2025-12-09부로 조건부주문을 Algo Service 이전. `STOP_MARKET`/`TAKE_PROFIT_MARKET`을 `/fapi/v1/order`→**`/fapi/v1/algoOrder`**(`algoType=CONDITIONAL`, `stopPrice`→`triggerPrice`)로 변경. testnet 양쪽 HTTP 200·algoStatus:NEW. 커밋 `0fee96f`·`d389631`·`659f50e` 푸시 완료.
