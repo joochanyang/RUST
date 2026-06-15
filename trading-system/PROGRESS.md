@@ -21,7 +21,7 @@
 >
 > **🚀 다음 세션 첫 액션 (순서대로)**:
 > 1. **배포 위치 결정(사용자)**: 맥북은 절전 freeze라 몇 주 무중단 부적합 → **Hetzner(5.161.112.248) 권장**. ⚠️결정 필요: ①어디서 돌릴지 ②`order_books` append-only·pruning 없음(수만행/분)→디스크/리텐션 정책 ③Hetzner면 캐처가 쓸 DB 위치(현재 DB는 맥북 로컬 `127.0.0.1`).
-> 2. **`.env`를 캐처-only(무거래)로 전환**: 현재 `TRADING_MODE=testnet`(주문 발생!) → `TRADING_MODE=paper`+`PAPER_TRADING_ENABLED=false`+`BINANCE_TESTNET_ENABLED=false`+`MARKET_DATA_ENABLED=true` 유지. (소스검증: 이 조합이면 주문 0, 캐처만.)
+> 2. **`.env`를 캐처-only(무거래)로 전환**: 체크인된 템플릿 사용 → `cp configs/capture-only.env .env` 후 DATABASE_URL/대시보드 시크릿만 채움. (현재 `.env`는 `TRADING_MODE=testnet`=주문 발생! 템플릿은 `paper`+`PAPER_TRADING_ENABLED=false`+`BINANCE_TESTNET_ENABLED=false`+`MARKET_DATA_ENABLED=true`=주문 0·캐처만, 소스검증·헤더에 근거.)
 > 3. **캐처 가동 + 헬스 모니터**: `RUST_LOG=trading_api=info cargo run -p trading-api --bin trading-api`. 분당 `order_books` insert rate / `MAX(event_time)` 모니터(절벽 탐지). staleness 수정으로 partial-stall은 자가복구되나, 외부 watchdog는 안전망(선택).
 > 4. **데이터 충분해지면**(몇 주 후): 오더북 imbalance 가설을 **사전등록 데이터분석부터**(imbalance가 다음 N틱 수익률/체결을 예측하는가? IC·분위수) → 신호 있으면 전략 구현+동일 WFO+OOS+수수료+적대적리뷰, 없으면 근거 있는 기각. ⚠️같은 family-wise 규율.
 > **⚠️비차단 한계(캐처엔 무방, 라이브 전 재검토)**: bybit `tickers.*`=델타채널→top-of-book 안 변해도 staleness 클럭 갱신됨. 백프레셔(DB 멈춤) 동안 탐지 지연. 상세=메모리 파일.
