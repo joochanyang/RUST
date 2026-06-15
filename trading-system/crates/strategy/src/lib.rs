@@ -17,6 +17,42 @@ pub struct TechnicalStrategy {
     overbought_threshold: f64,
 }
 
+impl TechnicalStrategy {
+    /// Build with explicit parameters. Used by the mean-reversion walk-forward
+    /// sweep (see `docs/superpowers/specs/2026-06-15-mean-reversion-validation-design.md`).
+    /// The Bollinger std-dev multiplier stays fixed at 2.0 by design — it is not
+    /// a swept knob.
+    pub fn new(
+        rsi_period: usize,
+        bollinger_period: usize,
+        oversold_threshold: f64,
+        overbought_threshold: f64,
+    ) -> Self {
+        Self {
+            rsi_period,
+            bollinger_period,
+            oversold_threshold,
+            overbought_threshold,
+        }
+    }
+
+    pub fn rsi_period(&self) -> usize {
+        self.rsi_period
+    }
+
+    pub fn bollinger_period(&self) -> usize {
+        self.bollinger_period
+    }
+
+    pub fn oversold_threshold(&self) -> f64 {
+        self.oversold_threshold
+    }
+
+    pub fn overbought_threshold(&self) -> f64 {
+        self.overbought_threshold
+    }
+}
+
 impl Default for TechnicalStrategy {
     fn default() -> Self {
         Self {
@@ -707,5 +743,41 @@ mod tests {
     fn rsi_returns_hundred_when_there_are_no_losses() {
         let closes = (1..20).map(|value| value as f64).collect::<Vec<_>>();
         assert_eq!(calculate_rsi(&closes, 14), Some(100.0));
+    }
+
+    // --- TechnicalStrategy parameterization (mean-reversion sweep) ------------
+
+    #[test]
+    fn technical_new_round_trips_getters() {
+        let strategy = TechnicalStrategy::new(7, 14, 20.0, 80.0);
+        assert_eq!(strategy.rsi_period(), 7);
+        assert_eq!(strategy.bollinger_period(), 14);
+        assert_eq!(strategy.oversold_threshold(), 20.0);
+        assert_eq!(strategy.overbought_threshold(), 80.0);
+    }
+
+    /// Proves the oversold threshold is actually wired into `evaluate`, not just
+    /// stored: the same extreme-drop history that the default (oversold 30) reads
+    /// as a Buy must produce no signal once the threshold is tightened below the
+    /// observed RSI.
+    #[test]
+    fn tighter_oversold_threshold_suppresses_a_default_buy() {
+        let mut candles = (0..20)
+            .map(|index| candle(index, Decimal::new(50_000 + index * 10, 0)))
+            .collect::<Vec<_>>();
+        candles.push(candle(21, Decimal::new(45_000, 0)));
+        candles.push(candle(22, Decimal::new(44_000, 0)));
+
+        // Default (oversold 30) signals Buy on this drop.
+        assert!(TechnicalStrategy::default()
+            .evaluate(&candles)
+            .iter()
+            .any(|signal| signal.side == Side::Buy));
+
+        // An impossibly strict oversold floor (RSI must be <= 0) cannot fire,
+        // confirming the parameter gates the signal rather than being inert.
+        assert!(TechnicalStrategy::new(14, 20, 0.0, 70.0)
+            .evaluate(&candles)
+            .is_empty());
     }
 }

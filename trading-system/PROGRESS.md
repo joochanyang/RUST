@@ -1,40 +1,42 @@
 # PROGRESS — trading-system (Rust 코인선물 AI 트레이딩)
 
-> 마지막 갱신: 2026-06-15 (★**추세필터 변동성돌파 워크포워드 검증 완료 → OOS 평균 −136.74, 1/4 윈도우만 +, 그마저 2×비용서 음전 → 롤링 돌파 계열 엣지 없음 확정(falsification 성공). 라이브 교체 안 함**). 다음 세션 이 파일부터 읽고 아래 "🚀 다음 세션 첫 액션".
+> 마지막 갱신: 2026-06-15 (★**평균회귀(RSI+볼린저) 워크포워드 검증 완료 → OOS 평균 −185.40, positive 0/4, expectancy 0/4, 거래수 충분(337~596) → 3번째 전략 패밀리도 엣지 없음 확정. 라이브 교체 안 함. 🔴 아직 커밋 안 함 — 사용자 승인 대기**). 다음 세션 이 파일부터 읽고 아래 "🚀 다음 세션 첫 액션".
 
 ## 🚀 다음 세션 첫 액션 — ★구조적으로 다른 전략 베팅 (clear 후 여기부터)
 **트리거 문구: "rust 트레이딩 이어서 작업" 또는 "실거래 전략 만들기 이어서"**
 
 > **목표(사용자)**: "실거래 할 수 있는 전략". 검증 가능 목표=**OOS에서 수수료 반영 후 일관 양(+)**.
-> **현재 결론**: 롤링윈도우 돌파 계열(순수 + 추세필터)은 **이 데이터(binance 1m, 100캔들 버퍼)에서 엣지 없음**이 워크포워드 OOS로 **두 번** 실증됨. **같은 데이터 위 4번째 노브 금지**(사전등록 STOP). 다음은 **구조적으로 다른 베팅**.
+> **현재 결론**: **3개 전략 패밀리(순수돌파·추세필터돌파·평균회귀) 전부** 이 데이터(binance 1m, 100캔들 버퍼, BTC+ETH, 2024~2026)에서 OOS 엣지 없음 실증. **같은 데이터·같은 1분봉 위에서 더 튜닝·더 노브 금지**(사전등록 STOP). 진짜 다른 방향=**다른 타임프레임 / 엔진버퍼 확장(정통 일봉) / 다른 데이터(오더북·펀딩비)**. 셋 다 보장 없음, 매번 OOS+수수료로 판정. **family-wise 주의**(같은 데이터 4번째 시도 = 거짓양성 누적).
 
-### ⚠️ 먼저 읽을 것 — 과최적화 함정 (두 번 실증됨, 재발 절대 금지)
+### ⚠️ 먼저 읽을 것 — 과최적화 함정 (★세 번 실증됨, 재발 절대 금지)
 1. **순수 변동성돌파**(lookback/k): 워크포워드 OOS 평균 **+0.00%**(수수료 전). IS-최적이 OOS서 무너짐.
-2. **추세필터 변동성돌파**(lookback/k/ma_period, +수수료 0.04%+슬리피지 0.01% 반영): 워크포워드 OOS **평균 −136.74·중앙값 −157.77·최악 −312·1/4 윈도우만 +**, 그 1개(W2 +80.81)도 **2×비용서 −38.45로 음전**. IS-best 파라미터 윈도우마다 계속 바뀜(lb10/k0.5/ma30→lb20/k0.7/ma50→lb10/k0.5/ma50→lb20/k0.7/ma50)=노이즈. IS 그리드 대부분 깊은 음수(W3/W4 전 그리드 빨강).
-- **교훈**: "백테스트 수익 좋아질 때까지 파라미터 돌리기"=과최적화 정의 그대로. **IS 숫자 믿지 말 것. OOS+수수료로만 판정.** 노브 추가=같은 복권 한 장 더. 새 전략도 반드시 같은 워크포워드+OOS+수수료로 검증.
+2. **추세필터 변동성돌파**(lookback/k/ma_period, +수수료): 워크포워드 OOS **평균 −136.74·1/4 윈도우만 +**, 그 1개도 2×비용서 음전. IS-best 파라미터 윈도우마다 바뀜=노이즈.
+3. **평균회귀(RSI+볼린저)**(2026-06-15, `TechnicalStrategy`, 평균회귀-적합 출구로 검증): OOS **평균 −185.40·positive 0/4·expectancy 0/4·거래수 337~596(충분)**. IS 27조합 전부 음수(−298~−4,964), 음수가 거래수에 비례(rsi7→1.5만거래→−4,964)=**스냅백이 taker수수료+슬리피지 못 이김**. ⭐**핵심 교훈: 검증 전 적대적 설계리뷰 필수** — 원래 계획은 돌파용 2:1 브래킷 출구를 평균회귀에 그대로 씌워 "잘못된 출구로 테스트"할 뻔했음(3에이전트 만장일치 CRITICAL). 출구를 중간밴드복귀/RSI50/하드스톱/시간스톱으로 고쳐서야 정직한 FAIL 판정 가능.
+- **교훈**: "백테스트 수익 좋아질 때까지 파라미터 돌리기"=과최적화 정의 그대로. **IS 숫자 믿지 말 것. OOS+수수료로만 판정.** **출구가 전략 논리와 맞는지 먼저 확인**(진입만 보면 안 됨). 새 전략도 반드시 같은 워크포워드+OOS+수수료+적대적리뷰로 검증.
 
-### ✅ 이번 세션 산출물 (커밋됨, 영구 인프라 — 다음 가설에 재사용)
-- **`TrendFilteredBreakoutStrategy`**(`crates/strategy/src/lib.rs`): 돌파+SMA 추세게이트. **코드 그대로 둠**(라이브는 안 씀 — `VolatilityBreakoutStrategy::default()` 유지). 향후 참고/복귀 가능. 17 strategy 테스트.
-- **백테스트 수수료/슬리피지 모델**(`backtest_runner.rs`): `trade_cost(entry,exit,qty,multiplier)` = (진입+청산 notional)×(taker 0.0004+슬리피지 0.0001)×배수. `close_positions`+tail루프서 차감, 승/패=비용후 PnL. **백테스트 전용**(라이브 PnL 불변). `BacktestConfig`에 `ma_period`/`cost_multiplier` 옵션 추가.
-- **워크포워드 falsification 하니스**(`backtest_runner.rs` 테스트모듈, `#[ignore]` 영구): 12조합(ma_period>lookback) 그리드×4윈도우 IS4mo→OOS2mo, 비용 1×/2×/3× 민감도, 평균·중앙값·최악 출력. 실행: `cargo test -p trading-api --bin trading-api backtest_runner::tests::walk_forward_trend_filter -- --ignored --nocapture`(DATABASE_URL 필요, ~424s). **새 가설도 이 하니스에 끼워 검증.**
-- spec: `docs/superpowers/specs/2026-06-15-trend-filtered-breakout-design.md`(적대적 리뷰 반영판, 커밋 `96a08df`). 적대적 설계리뷰가 "기대 OOS ~0%" 정확히 예측 → 실측은 음수로 더 명확.
+### ✅ 이번 세션 산출물 (평균회귀 검증 — 🔴 아직 커밋 안 함, 사용자 승인 대기)
+- **`TechnicalStrategy` 파라미터화**(`crates/strategy/src/lib.rs`): `new(rsi_period, bollinger_period, oversold, overbought)`+getter 추가. `Default` 불변. 라이브 미사용(라이브=`VolatilityBreakoutStrategy::default()` 유지). TDD 2테스트(비기본 임계값이 신호를 실제로 바꿈 검증).
+- **평균회귀 전용 백테스트 코어**(`backtest_runner.rs` 테스트모듈): `run_mean_reversion_backtest(pool,config,&TechnicalStrategy)` — 진입은 BasicRiskGate로 사이징하되 **출구는 평균회귀-적합**(하드스톱1%→중간밴드복귀(SMA)→RSI50재크로스→시간스톱60봉, 우선순위순). 프로덕션 `run_backtest`·`BacktestConfig`·HTTP API **전부 불변**(strategy 디스크리미네이터 추가 안 함 — strategy_version 오라벨·dyn디스패치·config비대화 회피). MR 출구 4단위테스트.
+- **평균회귀 워크포워드 하니스**(`#[ignore]` 영구): 27조합×4윈도우, IS최소거래(≥20)충족 조합 중 IS-best 선택, OOS 1×/2×/3×, 윈도우별 trades/wins/losses/per-trade expectancy/IS-best PnL+OOS 진단, **3진 판정(PASS/FAIL/INCONCLUSIVE)**. 실행: `cargo test -p trading-api --bin trading-api backtest_runner::tests::walk_forward_mean_reversion -- --ignored --nocapture`(DATABASE_URL 필요, ~815s).
+- spec: `docs/superpowers/specs/2026-06-15-mean-reversion-validation-design.md`(적대적 리뷰 반영판 + 실행결과 §8.1). **적대적 설계리뷰가 치명결함(추세용 출구) 잡아냄 — 이게 정직한 판정의 핵심.**
+- 테스트 **126 passed / 0 failed / 2 ignored**(이전 120/0/1 + MR 6테스트 + MR 하니스 1 ignored). fmt clean, clippy 신규0(기존 ai_repository 인자수 1만 잔존).
 
 ### ⏭ 다음 세션 — 구조적으로 다른 베팅 후보 (브레인스토밍부터)
-롤링 돌파는 끝. 진짜 다른 방향 (사용자와 brainstorming으로 1개 선택):
-1. **다른 타임프레임**(5m/15m/1h 캔들) — 1분봉 노이즈 회피. 버퍼 100캔들이면 1h×100=4일치 → 진짜 일/주 단위 추세 가능. ⚠️ 시장ingestion이 1m 외 구독하는지·DB에 5m/1h 적재됐는지 먼저 확인.
-2. **평균회귀**(기존 `TechnicalStrategy` RSI+볼린저를 같은 워크포워드+수수료로 정직 검증 — 한 번도 OOS 검증 안 함).
-3. **엔진 버퍼 확장**(`PAPER_MAX_CANDLES_PER_KEY`↑ + 시작 DB백필) → 정통 일봉 래리윌리엄스 가능. 단 엔진 수정=범위 커짐.
-4. **다른 데이터**(오더북 불균형/펀딩비) — trait 확장 필요(`evaluate`가 캔들만 받음).
-- ⚠️ 어느 것도 보장 없음. 매번 OOS+수수료로 판정. **여러 가설 시도 시 family-wise 과최적화 주의**(시도 횟수 자체가 거짓양성 누적).
+롤링 돌파 + 평균회귀(1분봉) 끝. 남은 진짜 다른 방향 (사용자와 brainstorming으로 1개 선택):
+1. **다른 타임프레임**(5m/15m/1h 캔들) — 1분봉 노이즈/수수료드래그 회피(평균회귀가 수수료에 죽은 게 시사점). 버퍼 100캔들이면 1h×100=4일치. ⚠️ 시장ingestion이 1m 외 구독하는지·DB에 5m/1h 적재됐는지 먼저 확인(현재 DB=1m만 적재 확인됨).
+2. **엔진 버퍼 확장**(`PAPER_MAX_CANDLES_PER_KEY`↑ + 시작 DB백필) → 정통 일봉 래리윌리엄스 가능. 단 엔진 수정=범위 커짐.
+3. **다른 데이터**(오더북 불균형/펀딩비) — trait 확장 필요(`evaluate`가 캔들만 받음).
+- ⚠️ 어느 것도 보장 없음. 매번 OOS+수수료+적대적리뷰로 판정. **family-wise 과최적화 주의**(같은 데이터 4번째 시도 = 거짓양성 누적 — 마진 PASS면 한 번도 안 쓴 새 홀드아웃 필수).
+- ❓ **사용자에게 물어볼 것**: 1분봉 3패밀리 다 무엣지 → 정말 다른 타임프레임/데이터로 갈지, 아니면 "실거래 전략 개발"을 여기서 일단 멈출지.
 
 ### 0. 그린 베이스라인 (먼저 복붙)
 ```bash
 cd ~/Documents/Rust/trading-system
 set -a; source .env; set +a
 export TEST_DATABASE_URL=$(echo "$DATABASE_URL" | sed 's#/trading_system$#/trading_system_test#')
-cargo test --workspace   # 기대: 109 passed / 0 failed (2026-06-15 실측)
+cargo test --workspace   # 기대: 126 passed / 0 failed / 2 ignored (2026-06-15 실측)
 ```
-⚠️git루트=부모 `~/Documents/Rust`. ⚠️.env 커밋금지. 봇 안 떠있음·미결 testnet 포지션 0.
+⚠️git루트=부모 `~/Documents/Rust`. ⚠️.env 커밋금지. 봇 안 떠있음·미결 testnet 포지션 0. 🔴 이번 세션 평균회귀 변경분 **워크트리에 미커밋** — 사용자 승인 후 커밋.
 
 ### 1. 접근 (TDD+워크포워드, 한 번에 한 가설)
 1. **브레인스토밍 먼저**(`superpowers:brainstorming`) — 어떤 시장 비효율/가설을 노릴지. 후보(직전 논의): ①변동성돌파+**추세필터**(장기 MA 방향과 같을 때만 진입→whipsaw 제거), ②평균회귀, ③추세추종, ④페어트레이딩(멀티심볼=trait 확장 필요). 기존 `TechnicalStrategy`(RSI)도 같은 워크포워드로 검증 가능.
