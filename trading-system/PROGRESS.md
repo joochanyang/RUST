@@ -1,6 +1,6 @@
 # PROGRESS — trading-system (Rust 코인선물 AI 트레이딩)
 
-> 마지막 갱신: 2026-06-15 (★**평균회귀(RSI+볼린저) 워크포워드 검증 완료 → OOS 평균 −185.40, positive 0/4, expectancy 0/4, 거래수 충분(337~596) → 3번째 전략 패밀리도 엣지 없음 확정. 라이브 교체 안 함. 🔴 아직 커밋 안 함 — 사용자 승인 대기**). 다음 세션 이 파일부터 읽고 아래 "🚀 다음 세션 첫 액션".
+> 마지막 갱신: 2026-06-15 (★**평균회귀(RSI+볼린저) 워크포워드 검증 완료 → OOS 평균 −185.40, positive 0/4, expectancy 0/4, 거래수 충분(337~596) → 3번째 전략 패밀리도 엣지 없음 확정. 라이브 교체 안 함. 커밋·푸시 완료 `91ac208`**). 다음 세션 이 파일부터 읽고 아래 "🚀 다음 세션 첫 액션". ★★다음 목표=사용자 선택 **다른 타임프레임(5m/1h)** — DB는 1m만 적재됨 → 1m 롤업으로 5m/1h 생성(추가 다운로드 불필요)부터.
 
 ## 🚀 다음 세션 첫 액션 — ★구조적으로 다른 전략 베팅 (clear 후 여기부터)
 **트리거 문구: "rust 트레이딩 이어서 작업" 또는 "실거래 전략 만들기 이어서"**
@@ -14,7 +14,7 @@
 3. **평균회귀(RSI+볼린저)**(2026-06-15, `TechnicalStrategy`, 평균회귀-적합 출구로 검증): OOS **평균 −185.40·positive 0/4·expectancy 0/4·거래수 337~596(충분)**. IS 27조합 전부 음수(−298~−4,964), 음수가 거래수에 비례(rsi7→1.5만거래→−4,964)=**스냅백이 taker수수료+슬리피지 못 이김**. ⭐**핵심 교훈: 검증 전 적대적 설계리뷰 필수** — 원래 계획은 돌파용 2:1 브래킷 출구를 평균회귀에 그대로 씌워 "잘못된 출구로 테스트"할 뻔했음(3에이전트 만장일치 CRITICAL). 출구를 중간밴드복귀/RSI50/하드스톱/시간스톱으로 고쳐서야 정직한 FAIL 판정 가능.
 - **교훈**: "백테스트 수익 좋아질 때까지 파라미터 돌리기"=과최적화 정의 그대로. **IS 숫자 믿지 말 것. OOS+수수료로만 판정.** **출구가 전략 논리와 맞는지 먼저 확인**(진입만 보면 안 됨). 새 전략도 반드시 같은 워크포워드+OOS+수수료+적대적리뷰로 검증.
 
-### ✅ 이번 세션 산출물 (평균회귀 검증 — 🔴 아직 커밋 안 함, 사용자 승인 대기)
+### ✅ 이번 세션 산출물 (평균회귀 검증 — 커밋·푸시 완료 `91ac208`)
 - **`TechnicalStrategy` 파라미터화**(`crates/strategy/src/lib.rs`): `new(rsi_period, bollinger_period, oversold, overbought)`+getter 추가. `Default` 불변. 라이브 미사용(라이브=`VolatilityBreakoutStrategy::default()` 유지). TDD 2테스트(비기본 임계값이 신호를 실제로 바꿈 검증).
 - **평균회귀 전용 백테스트 코어**(`backtest_runner.rs` 테스트모듈): `run_mean_reversion_backtest(pool,config,&TechnicalStrategy)` — 진입은 BasicRiskGate로 사이징하되 **출구는 평균회귀-적합**(하드스톱1%→중간밴드복귀(SMA)→RSI50재크로스→시간스톱60봉, 우선순위순). 프로덕션 `run_backtest`·`BacktestConfig`·HTTP API **전부 불변**(strategy 디스크리미네이터 추가 안 함 — strategy_version 오라벨·dyn디스패치·config비대화 회피). MR 출구 4단위테스트.
 - **평균회귀 워크포워드 하니스**(`#[ignore]` 영구): 27조합×4윈도우, IS최소거래(≥20)충족 조합 중 IS-best 선택, OOS 1×/2×/3×, 윈도우별 trades/wins/losses/per-trade expectancy/IS-best PnL+OOS 진단, **3진 판정(PASS/FAIL/INCONCLUSIVE)**. 실행: `cargo test -p trading-api --bin trading-api backtest_runner::tests::walk_forward_mean_reversion -- --ignored --nocapture`(DATABASE_URL 필요, ~815s).
@@ -36,7 +36,7 @@ set -a; source .env; set +a
 export TEST_DATABASE_URL=$(echo "$DATABASE_URL" | sed 's#/trading_system$#/trading_system_test#')
 cargo test --workspace   # 기대: 126 passed / 0 failed / 2 ignored (2026-06-15 실측)
 ```
-⚠️git루트=부모 `~/Documents/Rust`. ⚠️.env 커밋금지. 봇 안 떠있음·미결 testnet 포지션 0. 🔴 이번 세션 평균회귀 변경분 **워크트리에 미커밋** — 사용자 승인 후 커밋.
+⚠️git루트=부모 `~/Documents/Rust`. ⚠️.env 커밋금지. 봇 안 떠있음·미결 testnet 포지션 0. ✅ 이번 세션 평균회귀 변경분 커밋·푸시 완료(`91ac208`), 워크트리 clean.
 
 ### 1. 접근 (TDD+워크포워드, 한 번에 한 가설)
 1. **브레인스토밍 먼저**(`superpowers:brainstorming`) — 어떤 시장 비효율/가설을 노릴지. 후보(직전 논의): ①변동성돌파+**추세필터**(장기 MA 방향과 같을 때만 진입→whipsaw 제거), ②평균회귀, ③추세추종, ④페어트레이딩(멀티심볼=trait 확장 필요). 기존 `TechnicalStrategy`(RSI)도 같은 워크포워드로 검증 가능.
