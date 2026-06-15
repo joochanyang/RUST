@@ -51,6 +51,13 @@ pub struct BacktestConfig {
     /// Multiplies the per-trade fee+slippage cost. Defaults to 1.0 (production).
     /// The walk-forward harness sweeps 2.0/3.0 to test verdict robustness.
     pub cost_multiplier: Option<f64>,
+    /// Optional warm-up boundary. Candles loaded before this instant only warm
+    /// the strategy's rolling buffer (so longer-horizon trend filters are
+    /// computable at the true window start) but never open positions. `None`
+    /// (production, HTTP API, and the 1m/5m/1h harnesses) = every loaded candle
+    /// trades — unchanged. Used by the daily harness, where `period_start` is
+    /// pulled back to pre-roll the SMA buffer without inflating trade counts.
+    pub eval_start: Option<DateTime<Utc>>,
 }
 
 impl BacktestConfig {
@@ -74,6 +81,7 @@ impl BacktestConfig {
             k: self.k,
             ma_period: self.ma_period,
             cost_multiplier: self.cost_multiplier,
+            eval_start: self.eval_start,
         }
     }
 
@@ -134,6 +142,7 @@ pub async fn run_backtest(pool: &PgPool, config: BacktestConfig) -> Result<Backt
     let period_end = config.period_end.unwrap();
     let initial_equity = config.initial_equity.unwrap();
     let daily_loss_limit = config.daily_loss_limit.unwrap();
+    let eval_start = config.eval_start;
 
     if period_end <= period_start {
         return Err(TradingError::Configuration(
@@ -201,6 +210,13 @@ pub async fn run_backtest(pool: &PgPool, config: BacktestConfig) -> Result<Backt
         symbol_history.push(candle.clone());
         if symbol_history.len() > BACKTEST_HISTORY_LIMIT {
             symbol_history.remove(0);
+        }
+
+        // Pre-roll candles (before eval_start) only warm the buffer above; they
+        // do not evaluate signals or enter, so trade/signal counts reflect only
+        // the true window. With eval_start = None this never skips (unchanged).
+        if !entry_allowed_at(candle.open_time, eval_start) {
+            continue;
         }
 
         let signals = strategy.evaluate(symbol_history);
@@ -404,6 +420,20 @@ fn has_open_position(open_positions: &[BacktestPosition], signal: &Signal) -> bo
     open_positions
         .iter()
         .any(|position| position.symbol == signal.symbol)
+}
+
+/// Whether a candle at `candle_time` is allowed to open a new position.
+///
+/// `eval_start` is the optional warm-up boundary: when `Some(t)`, candles before
+/// `t` only fill the strategy's rolling buffer (warming the trend-filter MA) but
+/// never trade, so a window's trade/signal counts reflect only the true window
+/// even though earlier candles were loaded as pre-roll. `None` (production and the
+/// 1m/5m/1h harnesses) lets every loaded candle trade — unchanged behavior.
+fn entry_allowed_at(candle_time: DateTime<Utc>, eval_start: Option<DateTime<Utc>>) -> bool {
+    match eval_start {
+        Some(start) => candle_time >= start,
+        None => true,
+    }
 }
 
 pub fn metrics_to_json(metrics: &BacktestMetrics) -> serde_json::Value {
@@ -743,6 +773,24 @@ mod tests {
     }
 
     #[test]
+    fn entry_allowed_at_gates_only_pre_eval_start_candles() {
+        let boundary = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let before = Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap();
+        let after = Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap();
+
+        // No eval_start (production / 1m–1h paths): every candle may trade.
+        assert!(entry_allowed_at(before, None));
+        assert!(entry_allowed_at(boundary, None));
+        assert!(entry_allowed_at(after, None));
+
+        // With eval_start, only candles AT OR AFTER the boundary may enter; the
+        // earlier pre-roll candles warm the buffer but never trade.
+        assert!(!entry_allowed_at(before, Some(boundary)));
+        assert!(entry_allowed_at(boundary, Some(boundary)));
+        assert!(entry_allowed_at(after, Some(boundary)));
+    }
+
+    #[test]
     fn long_exit_prefers_stop_loss_when_same_candle_touches_both_sides() {
         let position = BacktestPosition {
             symbol: Symbol::new("BTCUSDT"),
@@ -934,6 +982,7 @@ mod tests {
             k: Some(combo.k),
             ma_period: Some(combo.ma_period),
             cost_multiplier: Some(cost_multiplier),
+            eval_start: None,
         };
         match run_backtest(pool, config).await {
             Ok(metrics) => metrics.realized_pnl,
@@ -1125,6 +1174,7 @@ mod tests {
             k: None,
             ma_period: None,
             cost_multiplier: Some(cost_multiplier),
+            eval_start: None,
         };
         let strategy = TechnicalStrategy::new(
             combo.rsi_period,
@@ -1358,6 +1408,7 @@ mod tests {
     // Run: `cargo test -p trading-api --bin trading-api \
     //        backtest_runner::tests::walk_forward_breakout_higher_timeframes -- --ignored --nocapture`
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_combo_tf(
         pool: &PgPool,
         timeframe: &str,
@@ -1365,12 +1416,21 @@ mod tests {
         end: DateTime<Utc>,
         combo: Combo,
         cost_multiplier: f64,
+        pre_roll_days: Option<i64>,
     ) -> BacktestMetrics {
+        // With pre-roll (daily harness), load `pre_roll_days` of extra history
+        // before `start` to warm the SMA buffer, but only trade from `start` on
+        // (eval_start = start). Without it (5m/1h), behavior is unchanged: the
+        // loaded window is exactly [start, end) and every candle may trade.
+        let (period_start, eval_start) = match pre_roll_days {
+            Some(days) => (start - Duration::days(days), Some(start)),
+            None => (start, None),
+        };
         let config = BacktestConfig {
             exchange: Some("binance".to_owned()),
             symbols: Some(vec!["BTCUSDT".to_owned(), "ETHUSDT".to_owned()]),
             timeframe: Some(timeframe.to_owned()),
-            period_start: Some(start),
+            period_start: Some(period_start),
             period_end: Some(end),
             initial_equity: Some(Decimal::new(10_000, 0)),
             daily_loss_limit: Some(Decimal::new(500, 0)),
@@ -1378,6 +1438,7 @@ mod tests {
             k: Some(combo.k),
             ma_period: Some(combo.ma_period),
             cost_multiplier: Some(cost_multiplier),
+            eval_start,
         };
         run_backtest(pool, config).await.unwrap_or_else(|error| {
             eprintln!("  combo run failed ({error}); treating as empty");
@@ -1441,7 +1502,7 @@ mod tests {
             // IS-best among combos clearing the trade floor (same rule as MR).
             let mut is_metrics: Vec<(Combo, BacktestMetrics)> = Vec::new();
             for &combo in &grid {
-                let m = run_combo_tf(pool, timeframe, is_start, oos_start, combo, 1.0).await;
+                let m = run_combo_tf(pool, timeframe, is_start, oos_start, combo, 1.0, None).await;
                 is_metrics.push((combo, m));
             }
             let pick = is_metrics
@@ -1464,9 +1525,9 @@ mod tests {
                 continue;
             };
 
-            let oos_1x = run_combo_tf(pool, timeframe, oos_start, oos_end, *best, 1.0).await;
-            let oos_2x = run_combo_tf(pool, timeframe, oos_start, oos_end, *best, 2.0).await;
-            let oos_3x = run_combo_tf(pool, timeframe, oos_start, oos_end, *best, 3.0).await;
+            let oos_1x = run_combo_tf(pool, timeframe, oos_start, oos_end, *best, 1.0, None).await;
+            let oos_2x = run_combo_tf(pool, timeframe, oos_start, oos_end, *best, 2.0, None).await;
+            let oos_3x = run_combo_tf(pool, timeframe, oos_start, oos_end, *best, 3.0, None).await;
             oos_results.push(pnl_f64(&oos_1x));
             oos_expectancies.push(expectancy(&oos_1x));
             window_trade_counts.push(oos_1x.trades);
@@ -1553,5 +1614,240 @@ mod tests {
         for timeframe in ["5m", "1h"] {
             walk_forward_breakout_for_timeframe(&pool, timeframe).await;
         }
+    }
+
+    // ----- Daily (1d) walk-forward harness -----------------------------------
+    //
+    // The user-selected next bet after pure/trend-filtered breakout and mean
+    // reversion all failed on 1m/5m/1h: a CLASSIC DAILY breakout. Design fixed
+    // by a 7-agent propose/attack/synthesize review (the verdict logic, grid,
+    // selector, fees, and floor are reused unchanged; only the window cadence is
+    // fit to daily data volume — a rule-permitted structural change, NOT entry
+    // tuning).
+    //
+    // Why this is a SEPARATE function (not a call to walk_forward_breakout_for_
+    // timeframe): that shared fn hard-codes a 4-window array and a `now`-clamp,
+    // and its `positive == 4` verdict is a banked 5m/1h falsification we must not
+    // mutate. Daily needs 3 windows, no clamp, n=3 verdict, and a warm-up
+    // pre-roll. So the loop+verdict are COPIED with n=3, reusing run_combo_tf /
+    // walk_forward_grid / pnl_f64 / expectancy / median / MR_MIN_TRADES verbatim.
+    //
+    // Three decisive daily facts (verified against the candle DB + code):
+    //  1. Warm-up burn: load_candles is [start,end) with NO pre-roll, so a 50-day
+    //     SMA eats the first ~50 candles/symbol of each window. On 6mo OOS that
+    //     would understate trade counts and force a false INCONCLUSIVE. Fixed via
+    //     pre_roll_days=Some(60): 60 extra days warm the buffer, eval_start=start
+    //     keeps those candles non-tradeable (see entry_allowed_at).
+    //  2. No now-clamp: the last OOS ends 2026-01-01 (pinned), so an INCONCLUSIVE
+    //     would be genuine thin volume, not a 6-week calendar sliver.
+    //  3. Degenerate selector: only lb10/k0.3 reliably clears the 20-trade floor
+    //     on daily, so the IS-best pick has little real choice — the printout
+    //     surfaces the per-window pick + signals_seen so a human can confirm.
+    //
+    // 2026-01 -> now is deliberately RESERVED as the fresh holdout any POSSIBLE
+    // EDGE must clear before a testnet move (family-wise overfitting guard).
+    //
+    // Run: `DATABASE_URL=… cargo test -p trading-api --bin trading-api \
+    //        backtest_runner::tests::walk_forward_breakout_daily_test -- --ignored --nocapture`
+
+    /// Largest ma_period in walk_forward_grid; the rolling buffer (and pre-roll)
+    /// must exceed it or daily signals are silently swallowed.
+    const DAILY_MAX_MA_PERIOD: usize = 50;
+    /// Calendar days of buffer pre-roll before each window's true start. 60 > the
+    /// 50-day SMA warm-up with slack for any missing daily candles.
+    const DAILY_PRE_ROLL_DAYS: i64 = 60;
+
+    // Compile-time buffer headroom: the rolling history must hold the longest MA
+    // plus its breakout candle. If the grid ever widens ma_period past the buffer
+    // (or the buffer shrinks), the build fails here instead of daily silently
+    // returning empty signals.
+    const _: () = assert!(BACKTEST_HISTORY_LIMIT > DAILY_MAX_MA_PERIOD);
+
+    async fn walk_forward_breakout_daily(pool: &PgPool) {
+        let grid = walk_forward_grid();
+        // 3 contiguous-IS windows, IS 12mo -> OOS 6mo, none clamped to now. The
+        // 2026-01..now tail is reserved as the fresh holdout (not tested here).
+        let windows: [(i32, u32, i32, u32, i32, u32); 3] = [
+            (2023, 7, 2024, 7, 2025, 1), // IS 2023-07..2024-07, OOS 2024-07..2025-01
+            (2024, 7, 2025, 1, 2025, 7), // IS 2024-07..2025-01, OOS 2025-01..2025-07
+            (2025, 1, 2025, 7, 2026, 1), // IS 2025-01..2025-07, OOS 2025-07..2026-01
+        ];
+
+        eprintln!(
+            "\n############ timeframe = 1d (daily breakout) ############\n\
+             grid = {} combos, 3 windows IS 12mo -> OOS 6mo, BTC+ETH, fee-aware, \
+             {}d pre-roll warm-up, min trades/window = {}. 2026-01..now reserved as holdout.",
+            grid.len(),
+            DAILY_PRE_ROLL_DAYS,
+            MR_MIN_TRADES,
+        );
+
+        let mut oos_results: Vec<f64> = Vec::new();
+        let mut oos_expectancies: Vec<f64> = Vec::new();
+        let mut window_trade_counts: Vec<u64> = Vec::new();
+
+        for (idx, w) in windows.iter().enumerate() {
+            let is_start = Utc.with_ymd_and_hms(w.0, w.1, 1, 0, 0, 0).unwrap();
+            let oos_start = Utc.with_ymd_and_hms(w.2, w.3, 1, 0, 0, 0).unwrap();
+            let oos_end = Utc.with_ymd_and_hms(w.4, w.5, 1, 0, 0, 0).unwrap();
+
+            // IS-best among combos clearing the trade floor (same rule as 5m/1h),
+            // each IS run pre-rolled so the SMA is warm at is_start.
+            let mut is_metrics: Vec<(Combo, BacktestMetrics)> = Vec::new();
+            for &combo in &grid {
+                let m = run_combo_tf(
+                    pool,
+                    "1d",
+                    is_start,
+                    oos_start,
+                    combo,
+                    1.0,
+                    Some(DAILY_PRE_ROLL_DAYS),
+                )
+                .await;
+                is_metrics.push((combo, m));
+            }
+            let pick = is_metrics
+                .iter()
+                .filter(|(_, m)| m.trades >= MR_MIN_TRADES)
+                .max_by(|a, b| pnl_f64(&a.1).partial_cmp(&pnl_f64(&b.1)).unwrap());
+            let Some((best, best_is)) = pick else {
+                eprintln!(
+                    "\nWindow {}: IS {}..{} -> OOS {}..{}\n  NO IS combo cleared {} trades — INCONCLUSIVE window.",
+                    idx + 1,
+                    is_start.date_naive(),
+                    oos_start.date_naive(),
+                    oos_start.date_naive(),
+                    oos_end.date_naive(),
+                    MR_MIN_TRADES,
+                );
+                oos_results.push(0.0);
+                oos_expectancies.push(0.0);
+                window_trade_counts.push(0);
+                continue;
+            };
+
+            let oos_1x = run_combo_tf(
+                pool,
+                "1d",
+                oos_start,
+                oos_end,
+                *best,
+                1.0,
+                Some(DAILY_PRE_ROLL_DAYS),
+            )
+            .await;
+            let oos_2x = run_combo_tf(
+                pool,
+                "1d",
+                oos_start,
+                oos_end,
+                *best,
+                2.0,
+                Some(DAILY_PRE_ROLL_DAYS),
+            )
+            .await;
+            let oos_3x = run_combo_tf(
+                pool,
+                "1d",
+                oos_start,
+                oos_end,
+                *best,
+                3.0,
+                Some(DAILY_PRE_ROLL_DAYS),
+            )
+            .await;
+            oos_results.push(pnl_f64(&oos_1x));
+            oos_expectancies.push(expectancy(&oos_1x));
+            window_trade_counts.push(oos_1x.trades);
+
+            eprintln!(
+                "\nWindow {}: IS {}..{} -> OOS {}..{}",
+                idx + 1,
+                is_start.date_naive(),
+                oos_start.date_naive(),
+                oos_start.date_naive(),
+                oos_end.date_naive()
+            );
+            eprintln!(
+                "  IS-best: lookback={} k={} ma_period={}  IS PnL={:.2} IS trades={} IS signals={}",
+                best.lookback,
+                best.k,
+                best.ma_period,
+                pnl_f64(best_is),
+                best_is.trades,
+                best_is.signals_seen,
+            );
+            eprintln!(
+                "  OOS PnL: 1x={:.2}  2x={:.2}  3x={:.2}  | OOS trades={} wins={} losses={} signals={} expectancy={:.4}",
+                pnl_f64(&oos_1x),
+                pnl_f64(&oos_2x),
+                pnl_f64(&oos_3x),
+                oos_1x.trades,
+                oos_1x.wins,
+                oos_1x.losses,
+                oos_1x.signals_seen,
+                expectancy(&oos_1x),
+            );
+        }
+
+        let n = oos_results.len();
+        let mean = oos_results.iter().sum::<f64>() / n as f64;
+        let med = median(oos_results.clone());
+        let worst = oos_results.iter().copied().fold(f64::INFINITY, f64::min);
+        let positive = oos_results.iter().filter(|&&p| p > 0.0).count();
+        let below_floor = window_trade_counts
+            .iter()
+            .filter(|&&t| t < MR_MIN_TRADES)
+            .count();
+        let positive_expectancy = oos_expectancies.iter().filter(|&&e| e > 0.0).count();
+
+        eprintln!("\n=== 1d OOS SUMMARY (1x cost) ===");
+        eprintln!("  per-window PnL:        {oos_results:?}");
+        eprintln!("  per-window expectancy: {oos_expectancies:?}");
+        eprintln!("  per-window trades:     {window_trade_counts:?}");
+        eprintln!(
+            "  mean={mean:.2} median={med:.2} worst={worst:.2} positive={positive}/{n} \
+             positive_expectancy={positive_expectancy}/{n} windows_below_{MR_MIN_TRADES}_trades={below_floor}"
+        );
+
+        // Same three-way verdict as 5m/1h, hard-coded for n=3. A POSSIBLE EDGE is
+        // PROVISIONAL: it must survive 2x cost AND the reserved 2026-01..now
+        // holdout before any testnet step (family-wise guard — 4th family on the
+        // same BTC/ETH regime). With only 3 windows "all positive" is a weaker
+        // bar than 4/4, so the provisional framing matters more here.
+        let verdict = if below_floor > 0 {
+            "INCONCLUSIVE — at least one window below the trade floor; too few daily \
+             trades to test fairly even with pre-roll. NOT a falsification."
+        } else if positive == n && positive_expectancy == n && mean > 0.0 {
+            "POSSIBLE EDGE (PROVISIONAL) — all 3 windows positive with positive \
+             expectancy. Do NOT adopt: 3/3 is a ~12.5%-under-noise bar; require 2x-cost \
+             survival AND the reserved 2026-01..now holdout before any testnet move."
+        } else {
+            "FAIL (no edge) — sufficient trades but not consistently positive after fees. \
+             Clean falsification -> STOP."
+        };
+        eprintln!("=== 1d VERDICT ===\n  {verdict}");
+    }
+
+    #[tokio::test]
+    #[ignore = "daily walk-forward replay over the production candle DB; run explicitly"]
+    async fn walk_forward_breakout_daily_test() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping daily walk-forward; DATABASE_URL is not set");
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await
+            .expect("connect candle database");
+
+        eprintln!(
+            "=== Walk-forward: CLASSIC DAILY (1d) breakout ===\n\
+             4th strategy family on the same BTC/ETH/2023-26 regime; engineered to \
+             FALSIFY (a FAIL kills the daily bet; a pass is provisional only)."
+        );
+        walk_forward_breakout_daily(&pool).await;
     }
 }
