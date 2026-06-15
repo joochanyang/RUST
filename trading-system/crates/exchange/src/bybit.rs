@@ -153,6 +153,15 @@ async fn run_public_market_stream_once(
         .await
         .map_err(|error| TradingError::Exchange(format!("Bybit subscribe failed: {error}")))?;
     let mut ticker_state = HashMap::new();
+    // Receive-time of the most recent order-book frame; see binance.rs for why
+    // the whole-socket idle timeout can't see a ticker-only stall. Bybit
+    // multiplexes ticker + kline on one socket, so a trickling kline frame masks
+    // a dead ticker stream on the shared idle timer — making this check essential.
+    // Anchored to the connect instant (this socket always subscribes tickers.*),
+    // so a ticker topic that never (re)starts after a reconnect — while klines
+    // keep arriving — is still caught instead of silently streaming kline-only.
+    let mut last_orderbook_at: Option<chrono::DateTime<Utc>> = Some(Utc::now());
+    let staleness = chrono::Duration::seconds(trading_core::ORDERBOOK_STREAM_STALENESS_SECS);
 
     loop {
         // A silent connection must not hang the loop forever: time the read out so
@@ -173,7 +182,11 @@ async fn run_public_market_stream_once(
                     continue;
                 }
                 let event = parse_market_payload_with_state(text.as_ref(), &mut ticker_state)?;
-                let observed = trading_core::ObservedMarketEvent::new(event, Utc::now());
+                let now = Utc::now();
+                if matches!(event, MarketEvent::OrderBook(_)) {
+                    last_orderbook_at = Some(now);
+                }
+                let observed = trading_core::ObservedMarketEvent::new(event, now);
                 if sender.send(Ok(observed)).await.is_err() {
                     return Ok(());
                 }
@@ -187,6 +200,14 @@ async fn run_public_market_stream_once(
                     "Bybit WebSocket read failed: {error}"
                 )));
             }
+        }
+
+        // Partial stall: order-book frames stopped while other frames keep the
+        // socket alive. Reconnect rather than stream stale data.
+        if trading_core::orderbook_stream_is_stale(last_orderbook_at, Utc::now(), staleness) {
+            return Err(TradingError::Exchange(format!(
+                "Bybit order-book stream stalled: no order-book frame within {staleness}"
+            )));
         }
     }
 }

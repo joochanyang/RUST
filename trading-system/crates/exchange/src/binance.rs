@@ -74,8 +74,14 @@ impl ExchangeAdapter for BinanceAdapter {
 
         for url in urls {
             let sender = sender.clone();
+            // Only the bookTicker socket carries order-book frames; the kline
+            // socket carries none, so it must NOT arm the order-book staleness
+            // clock or it would reconnect every cycle on a healthy feed.
+            let expects_orderbook = url.contains("bookTicker");
             tokio::spawn(async move {
-                if let Err(error) = run_public_market_stream_with_reconnect(url, sender).await {
+                if let Err(error) =
+                    run_public_market_stream_with_reconnect(url, sender, expects_orderbook).await
+                {
                     tracing::warn!(%error, "Binance market stream stopped");
                 }
             });
@@ -768,6 +774,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 async fn run_public_market_stream_with_reconnect(
     url: String,
     sender: mpsc::Sender<Result<trading_core::ObservedMarketEvent>>,
+    expects_orderbook: bool,
 ) -> Result<()> {
     let mut backoff = Duration::from_secs(1);
 
@@ -776,7 +783,13 @@ async fn run_public_market_stream_with_reconnect(
             return Ok(());
         }
 
-        match run_public_market_stream_once(&url, sender.clone(), MARKET_STREAM_IDLE_TIMEOUT).await
+        match run_public_market_stream_once(
+            &url,
+            sender.clone(),
+            MARKET_STREAM_IDLE_TIMEOUT,
+            expects_orderbook,
+        )
+        .await
         {
             Ok(()) => {
                 backoff = Duration::from_secs(1);
@@ -799,11 +812,26 @@ async fn run_public_market_stream_once(
     url: &str,
     sender: mpsc::Sender<Result<trading_core::ObservedMarketEvent>>,
     idle_timeout: Duration,
+    expects_orderbook: bool,
 ) -> Result<()> {
     let (stream, _) = connect_async(url).await.map_err(|error| {
         TradingError::Exchange(format!("Binance WebSocket connect failed: {error}"))
     })?;
     let (_, mut read) = stream.split();
+
+    // Receive-time of the most recent order-book frame on THIS connection. The
+    // whole-socket idle timeout below resets on any frame (ping/kline included),
+    // so it cannot see a bookTicker-only stall; tracking the order-book gap
+    // separately is what catches that production failure mode.
+    //
+    // Anchored to the connect instant on order-book-bearing sockets so a feed
+    // that NEVER (re)starts order-book frames — while kline/pings keep the socket
+    // alive past the idle timeout — is still caught (the partial-stall bug would
+    // otherwise silently reappear one reconnect later). The kline-only socket
+    // passes `false` and stays `None`, leaving its check inert (the whole-socket
+    // idle timeout guards it) so a healthy kline feed never false-reconnects.
+    let mut last_orderbook_at: Option<chrono::DateTime<Utc>> = expects_orderbook.then(Utc::now);
+    let staleness = chrono::Duration::seconds(trading_core::ORDERBOOK_STREAM_STALENESS_SECS);
 
     loop {
         // A silent connection (no data, no ping, no close) must not hang the loop
@@ -824,7 +852,11 @@ async fn run_public_market_stream_once(
         match message {
             Ok(Message::Text(text)) => {
                 let event = parse_market_payload(text.as_ref())?;
-                let observed = trading_core::ObservedMarketEvent::new(event, Utc::now());
+                let now = Utc::now();
+                if matches!(event, MarketEvent::OrderBook(_)) {
+                    last_orderbook_at = Some(now);
+                }
+                let observed = trading_core::ObservedMarketEvent::new(event, now);
                 if sender.send(Ok(observed)).await.is_err() {
                     return Ok(());
                 }
@@ -838,6 +870,15 @@ async fn run_public_market_stream_once(
                     "Binance WebSocket read failed: {error}"
                 )));
             }
+        }
+
+        // Partial stall: order-book frames stopped while other frames keep the
+        // socket alive. Surface an error so the caller reconnects rather than
+        // streaming stale data the latency gate would silently block on.
+        if trading_core::orderbook_stream_is_stale(last_orderbook_at, Utc::now(), staleness) {
+            return Err(TradingError::Exchange(format!(
+                "Binance order-book stream stalled: no order-book frame within {staleness}"
+            )));
         }
     }
 }
@@ -1395,7 +1436,8 @@ mod tests {
         let idle_timeout = Duration::from_millis(500);
         let start = Instant::now();
         let result =
-            run_public_market_stream_once(&format!("ws://{addr}/"), sender, idle_timeout).await;
+            run_public_market_stream_once(&format!("ws://{addr}/"), sender, idle_timeout, true)
+                .await;
         let elapsed = start.elapsed();
 
         assert!(

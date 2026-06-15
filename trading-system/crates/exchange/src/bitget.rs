@@ -155,6 +155,16 @@ async fn run_public_market_stream_once(
         .await
         .map_err(|error| TradingError::Exchange(format!("Bitget subscribe failed: {error}")))?;
 
+    // Receive-time of the most recent order-book frame; see binance.rs for why
+    // the whole-socket idle timeout can't see a ticker-only stall. Bitget
+    // multiplexes ticker + candle on one socket, so a trickling candle frame
+    // masks a dead ticker stream on the shared idle timer. Anchored to the
+    // connect instant (this socket always subscribes the ticker channel), so a
+    // ticker channel that never (re)starts after a reconnect — while candles
+    // keep arriving — is still caught instead of silently streaming candle-only.
+    let mut last_orderbook_at: Option<chrono::DateTime<Utc>> = Some(Utc::now());
+    let staleness = chrono::Duration::seconds(trading_core::ORDERBOOK_STREAM_STALENESS_SECS);
+
     loop {
         // A silent connection must not hang the loop forever: time the read out so
         // the reconnect loop can re-establish it.
@@ -174,7 +184,11 @@ async fn run_public_market_stream_once(
                     continue;
                 }
                 let event = parse_market_payload(text.as_ref())?;
-                let observed = trading_core::ObservedMarketEvent::new(event, Utc::now());
+                let now = Utc::now();
+                if matches!(event, MarketEvent::OrderBook(_)) {
+                    last_orderbook_at = Some(now);
+                }
+                let observed = trading_core::ObservedMarketEvent::new(event, now);
                 if sender.send(Ok(observed)).await.is_err() {
                     return Ok(());
                 }
@@ -188,6 +202,14 @@ async fn run_public_market_stream_once(
                     "Bitget WebSocket read failed: {error}"
                 )));
             }
+        }
+
+        // Partial stall: order-book frames stopped while other frames keep the
+        // socket alive. Reconnect rather than stream stale data.
+        if trading_core::orderbook_stream_is_stale(last_orderbook_at, Utc::now(), staleness) {
+            return Err(TradingError::Exchange(format!(
+                "Bitget order-book stream stalled: no order-book frame within {staleness}"
+            )));
         }
     }
 }

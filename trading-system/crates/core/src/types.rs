@@ -12,6 +12,40 @@ pub type Result<T> = std::result::Result<T, TradingError>;
 /// (`trading-api`), so the two can never drift.
 pub const MARKET_DATA_LATENCY_THRESHOLD_MS: i64 = 2_000;
 
+/// How long an exchange may go without delivering a single ORDER-BOOK frame
+/// before the public market stream is treated as partially stalled and forced
+/// to reconnect. This is distinct from the whole-socket idle timeout: a healthy
+/// connection that keeps trickling pings / low-frequency kline frames resets the
+/// idle timer forever, so a bookTicker-only stall (observed in production: order
+/// book frames stopped while the socket stayed "alive", throughput collapsed and
+/// candle freshness lagged 16-23min) is invisible to it. Tracking the gap since
+/// the last order-book event specifically is what catches that case.
+///
+/// 30s is well above the normal sub-second bookTicker cadence on every venue we
+/// subscribe (binance/bybit/bitget), so a healthy stream never trips it, while a
+/// genuine stall surfaces within one window instead of running indefinitely.
+pub const ORDERBOOK_STREAM_STALENESS_SECS: i64 = 30;
+
+/// Decide whether the order-book side of a public market stream has gone stale.
+///
+/// `last_orderbook_at` is the receive-time of the most recent `MarketEvent::OrderBook`
+/// seen on this connection (`None` until the first one arrives). Returns `true`
+/// once `now` is more than `threshold` past that instant, signalling the read
+/// loop to drop the connection so the reconnect loop can re-establish it. Pure so
+/// the partial-stall decision can be unit-tested without a live socket. Before the
+/// first order-book frame arrives we do NOT report stale — the whole-socket idle
+/// timeout still guards a connection that never produces anything.
+pub fn orderbook_stream_is_stale(
+    last_orderbook_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    threshold: chrono::Duration,
+) -> bool {
+    match last_orderbook_at {
+        Some(seen_at) => now.signed_duration_since(seen_at) > threshold,
+        None => false,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum TradingError {
     #[error("configuration error: {0}")]
@@ -458,6 +492,41 @@ mod tests {
             observed.latency_ms > MARKET_DATA_LATENCY_THRESHOLD_MS,
             "a candle arriving 5s after its close must still be flagged stale, got {}ms",
             observed.latency_ms
+        );
+    }
+
+    // Production partial-stall repro (PROGRESS.md incident): order-book frames
+    // stop, but pings / low-frequency frames keep the socket alive so the
+    // whole-socket idle timeout never fires. The order-book staleness check must
+    // catch it by tracking the gap since the last OrderBook event specifically.
+    #[test]
+    fn partial_orderbook_stall_is_detected_even_while_socket_alive() {
+        let last_orderbook_at = open_time_at(1_710_000_000);
+        let threshold = chrono::Duration::seconds(ORDERBOOK_STREAM_STALENESS_SECS);
+        // 40s with no order-book frame (other frames still arriving): stale.
+        let now = last_orderbook_at + chrono::Duration::seconds(40);
+        assert!(
+            orderbook_stream_is_stale(Some(last_orderbook_at), now, threshold),
+            "an order-book stall past the threshold must be reported stale"
+        );
+    }
+
+    #[test]
+    fn healthy_orderbook_stream_is_not_stale() {
+        let last_orderbook_at = open_time_at(1_710_000_000);
+        let threshold = chrono::Duration::seconds(ORDERBOOK_STREAM_STALENESS_SECS);
+        // A sub-second cadence stream is never stale.
+        let now = last_orderbook_at + chrono::Duration::milliseconds(200);
+        assert!(
+            !orderbook_stream_is_stale(Some(last_orderbook_at), now, threshold),
+            "a live order-book stream must not be reported stale"
+        );
+        // Before the first order-book frame, the per-stream check stays silent and
+        // defers to the whole-socket idle timeout.
+        let now_later = last_orderbook_at + chrono::Duration::seconds(120);
+        assert!(
+            !orderbook_stream_is_stale(None, now_later, threshold),
+            "no order-book frame yet must not trip the per-stream staleness check"
         );
     }
 
