@@ -24,6 +24,12 @@ pub const MARKET_DATA_LATENCY_THRESHOLD_MS: i64 = 2_000;
 /// 30s is well above the normal sub-second bookTicker cadence on every venue we
 /// subscribe (binance/bybit/bitget), so a healthy stream never trips it, while a
 /// genuine stall surfaces within one window instead of running indefinitely.
+///
+/// This is a LOWER bound on detection latency, not an upper bound: the check runs
+/// after a frame is processed, and effective latency = threshold + worst-case
+/// consumer-block (the read loop can't evaluate staleness while `send().await`
+/// is blocked on mpsc backpressure, e.g. a stalled DB write). Acceptable for the
+/// capture use case; tighten via a decoupled timer if ever needed on a live path.
 pub const ORDERBOOK_STREAM_STALENESS_SECS: i64 = 30;
 
 /// Decide whether the order-book side of a public market stream has gone stale.

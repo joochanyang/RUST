@@ -184,6 +184,11 @@ async fn run_public_market_stream_once(
                 let event = parse_market_payload_with_state(text.as_ref(), &mut ticker_state)?;
                 let now = Utc::now();
                 if matches!(event, MarketEvent::OrderBook(_)) {
+                    // tickers.* is a DELTA channel: a frame whose best bid/ask did
+                    // not move still parses to an OrderBook and refreshes the clock.
+                    // So this guarantees "ticker frames keep arriving", not
+                    // "top-of-book keeps moving" — a genuinely frozen book is out of
+                    // scope here (fine for capture; revisit before any live use).
                     last_orderbook_at = Some(now);
                 }
                 let observed = trading_core::ObservedMarketEvent::new(event, now);
