@@ -18,6 +18,10 @@ pub struct BacktestConfig {
     pub period_end: Option<DateTime<Utc>>,
     pub initial_equity: Option<Decimal>,
     pub daily_loss_limit: Option<Decimal>,
+    /// Volatility-breakout strategy parameters. When omitted, the strategy's
+    /// own defaults (lookback 20, k 0.5) apply. Used for walk-forward sweeps.
+    pub lookback: Option<usize>,
+    pub k: Option<f64>,
 }
 
 impl BacktestConfig {
@@ -37,6 +41,8 @@ impl BacktestConfig {
             period_end: Some(period_end),
             initial_equity: Some(self.initial_equity.unwrap_or(Decimal::new(10_000, 0))),
             daily_loss_limit: Some(self.daily_loss_limit.unwrap_or(Decimal::new(500, 0))),
+            lookback: self.lookback,
+            k: self.k,
         }
     }
 
@@ -120,7 +126,14 @@ pub async fn run_backtest(pool: &PgPool, config: BacktestConfig) -> Result<Backt
         ));
     }
 
-    let strategy = VolatilityBreakoutStrategy::default();
+    let default_strategy = VolatilityBreakoutStrategy::default();
+    let strategy = match (config.lookback, config.k) {
+        (None, None) => default_strategy,
+        (lookback, k) => VolatilityBreakoutStrategy::new(
+            lookback.unwrap_or_else(|| default_strategy.lookback()),
+            k.unwrap_or_else(|| default_strategy.k()),
+        ),
+    };
     let risk_gate = BasicRiskGate::default();
     let mut equity = initial_equity;
     let mut peak_equity = initial_equity;

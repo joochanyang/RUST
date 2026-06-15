@@ -1,7 +1,50 @@
 # PROGRESS — trading-system (Rust 코인선물 AI 트레이딩)
 
-> 마지막 갱신: 2026-06-15 (★**변동성돌파 전략 구현 완료 + 6개월 백테스트 검증 완료**). 다음 세션에서 이 파일부터 읽고 "다음 세션 첫 액션"으로 이동.
-> **★사용자 결정 대기**: 백테스트까지만 멈출지 / testnet 라이브로 갈지 (아래 "백테스트 결과" 참조).
+> 마지막 갱신: 2026-06-15 (★**워크포워드 검증 완료 → 순수 변동성돌파 엣지 없음. 다음 세션=실거래용 새 전략 개발 착수**). 다음 세션에서 이 파일부터 읽고 아래 "🚀 다음 세션 첫 액션"으로.
+
+## 🚀 다음 세션 첫 액션 — ★실거래 가능한 전략 개발 (clear 후 여기부터)
+**트리거 문구: "rust 트레이딩 이어서 작업" 또는 "실거래 전략 만들기 이어서"**
+
+> **목표(사용자)**: "실거래 할 수 있는 전략"을 만든다. 단 **"완벽"=무한튜닝이 아님**(아래 ⚠️). 검증 가능한 목표=**OOS에서 일관되게 양(+)·수수료/슬리피지 반영 후 생존**.
+
+### ⚠️ 먼저 읽을 것 — 과최적화 함정 (방금 실증됨, 재발 금지)
+직전 세션에 순수 변동성돌파(lookback/k)를 **워크포워드+OOS로 정직하게** 검증한 결과 **OOS 평균 +0.00%**(아래 "워크포워드 결과"). IS(과거)에서 최고 파라미터가 OOS(미래)에서 거의 매번 무너졌고, 최적 파라미터가 윈도우마다 계속 바뀜=노이즈. **교훈: "백테스트 수익 좋아질 때까지 파라미터 돌리기"=과최적화 정의 그대로. IS 숫자 믿지 말 것. OOS 숫자로만 판정.** 새 전략도 반드시 같은 워크포워드+OOS로 검증.
+
+### 0. 그린 베이스라인 (먼저 복붙)
+```bash
+cd ~/Documents/Rust/trading-system
+set -a; source .env; set +a
+export TEST_DATABASE_URL=$(echo "$DATABASE_URL" | sed 's#/trading_system$#/trading_system_test#')
+cargo test --workspace   # 기대: 109 passed / 0 failed (2026-06-15 실측)
+```
+⚠️git루트=부모 `~/Documents/Rust`. ⚠️.env 커밋금지. 봇 안 떠있음·미결 testnet 포지션 0.
+
+### 1. 접근 (TDD+워크포워드, 한 번에 한 가설)
+1. **브레인스토밍 먼저**(`superpowers:brainstorming`) — 어떤 시장 비효율/가설을 노릴지. 후보(직전 논의): ①변동성돌파+**추세필터**(장기 MA 방향과 같을 때만 진입→whipsaw 제거), ②평균회귀, ③추세추종, ④페어트레이딩(멀티심볼=trait 확장 필요). 기존 `TechnicalStrategy`(RSI)도 같은 워크포워드로 검증 가능.
+2. **구현**: `crates/strategy/src/lib.rs`에 새 `impl Strategy`(엔진 불변 패턴 유지). 캔들만으로 부족하면(오더북/펀딩비) trait 확장 검토(spec §9 한계).
+3. **검증(필수·정직)**: 워크포워드+OOS. **인프라 이미 있음** → 아래 §2.
+4. **머니패스·엔진 변경 시**: RED→GREEN+적대적 리뷰(함정 섹션 규칙).
+
+### 2. 워크포워드 검증 인프라 (이미 구축됨 — 재사용)
+- `BacktestConfig.lookback/k`(옵셔널) + `VolatilityBreakoutStrategy::new(lookback,k)`/`.lookback()`/`.k()` 추가됨(이번 세션). `run_backtest`가 파라미터 주입. **새 전략도 동일 패턴으로 파라미터화**하면 그리드 가능.
+- 워크포워드 하니스(IS 그리드→OOS 검증, 4윈도우, ~84런/472s)는 `#[ignore]` 임시 tokio 테스트로 돌렸다 제거함. **재구현 템플릿**=직전 세션 `walk_forward_param_sweep`(git 히스토리/이 파일 워크포워드 섹션 참고). 핵심: IS에서 고르고 **OOS로만 보고**, 전체 그리드도 출력해 plateau/spike 구분.
+- ⚠️`BACKTEST_HISTORY_LIMIT=64` → lookback≤50. DB에 binance BTC/ETH 1m 3년치(2023-06-13~2026-06-15, 구멍 없음) 적재됨(import 불필요).
+- ⚠️**백테스트 러너는 수수료/슬리피지 미반영** → 실거래 판정 전 반드시 추가(taker~0.04%×거래수). 안 그러면 OOS가 과대평가됨.
+
+### 3. 사용자 미결정 (다음 세션 시작 시 브레인스토밍에서 확정)
+- 어떤 가설/전략으로 갈지(추세필터 vs 평균회귀 vs 기타). 직전 세션 내 추천=**추세필터 1회 시도**(변동성돌파에 장기MA 방향 게이트 추가). 보장은 없고 OOS로 재검증 필수.
+- 실거래 직전 체크리스트(미정): 수수료/슬리피지 반영 백테스트 + testnet 라이브 e2e(보호주문 SL/TP) + 소액 실거래 1회 테스트.
+
+---
+### 📉 워크포워드 + OOS 튜닝 결과 (2026-06-15, 직전 세션 — 순수 변동성돌파 엣지 없음 실증)
+**OOS(정직한 숫자)**: W1 lb10/k0.5→−1.85%, W2 lb30/k0.5→+3.20%, W3 lb50/k0.7→−1.34%, W4 lb20/k0.5→−0.01%. **OOS 평균 +0.00%**. (4개월 IS 그리드 20조합→2개월 OOS 검증, BTC+ETH, 4윈도우 2024-06~2026-06.) IS-최적이 OOS서 무너짐+파라미터 윈도우마다 바뀜=강건한 엣지 없음. 수수료 미반영인데도 0%=실질 마이너스. W2 +3.2%는 추세국면 1회뿐.
+
+---
+
+### 🛠 이번 세션 추가 인프라 (영구 유지)
+`BacktestConfig.lookback/k`(옵셔널) 주입 + `VolatilityBreakoutStrategy::new(lookback,k)`/`.lookback()`/`.k()` 추가 → 워크포워드 그리드용. 라이브 런타임 불변(default 그대로), HTTP API 하위호환. **109 passed, fmt/clippy clean**. 워크포워드 하니스(`walk_forward_param_sweep`)는 `#[ignore]` 임시테스트로 돌린 뒤 제거(워크트리에 없음, git 히스토리로 복원 가능).
+
+> ⚠️ **미수정 엔진 결함 (standing order)**: testnet 봇 첫 가동(03:52~04:31) 후 **고빈도 WS 스트림(bookTicker) 부분 스톨** — 이벤트 16k~33k/분→1.2k/분 폭락, 캔들 close_time이 실시간보다 16~23분 뒤처져 latency-gate가 모든 진입 차단(WARN 5776건). **머신 절전 아님**(이벤트 ts 연속·분 누락 0), 포지션/주문 0·돈위험 0(게이트 정상). 기존 idle-timeout 재연결(`077ee9e`)이 **부분 스톨은 못 잡음**(연결이 트리클로 살아있어 'idle' 아님). 재시작으로 복구. **★사용자 standing order**: "부분 스톨 재발하면 per-stream staleness 감지 구현" — 타깃=`binance.rs`/`bybit.rs`/`bitget.rs`의 `run_public_market_stream_once`에 per-(symbol/channel) 마지막 프레임 시각 추적→개별 스트림 idle_timeout 초과 시 reconnect. TDD+적대적 리뷰 필수. **봇 재가동 시에만 유효(현재 봇 내려감)**.
 
 ## 현재 상태 (한 줄)
 머니6종 + 후속 + reconcile + **latency-gate + Bitget 8h + 보호주문 Algo API(+e2e 라이브 종결) + 출시 전 감사 P0/P1 + runbook 정합성 + WS silent-stall 재연결 완료**.

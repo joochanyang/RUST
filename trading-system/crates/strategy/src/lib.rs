@@ -100,12 +100,25 @@ pub struct VolatilityBreakoutStrategy {
     k: f64,
 }
 
+impl VolatilityBreakoutStrategy {
+    /// Constructs the strategy with explicit parameters. Used by the backtest
+    /// runner for walk-forward parameter sweeps; live runtimes use `default()`.
+    pub fn new(lookback: usize, k: f64) -> Self {
+        Self { lookback, k }
+    }
+
+    pub fn lookback(&self) -> usize {
+        self.lookback
+    }
+
+    pub fn k(&self) -> f64 {
+        self.k
+    }
+}
+
 impl Default for VolatilityBreakoutStrategy {
     fn default() -> Self {
-        Self {
-            lookback: 20,
-            k: 0.5,
-        }
+        Self::new(20, 0.5)
     }
 }
 
