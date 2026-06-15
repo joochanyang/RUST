@@ -1,6 +1,6 @@
 # PROGRESS — trading-system (Rust 코인선물 AI 트레이딩)
 
-> 마지막 갱신: 2026-06-15 (보호주문 e2e 라이브 종결 + WS재연결 + position sweep. **다음=새 전략 만들기**). 다음 세션에서 이 파일부터 읽고 "다음 세션 첫 액션"으로 이동.
+> 마지막 갱신: 2026-06-15 (★**변동성돌파 전략 설계·데이터분석·spec 커밋 완료 — 구현 직전**). 다음 세션에서 이 파일부터 읽고 "다음 세션 첫 액션"으로 이동.
 
 ## 현재 상태 (한 줄)
 머니6종 + 후속 + reconcile + **latency-gate + Bitget 8h + 보호주문 Algo API(+e2e 라이브 종결) + 출시 전 감사 P0/P1 + runbook 정합성 + WS silent-stall 재연결 완료**.
@@ -52,43 +52,51 @@
 - **검증(TDD RED→GREEN + 적대적 리뷰 2회)**: 설계 워크플로(7에이전트: 3제안→3공격→종합, Proposal 3 채택=치명결함 0)→구현→커밋 전 적대적 리뷰(4에이전트, **ship-as-is·must-fix 0**, 유일 지적=Bitget 비-1m 대문자형 잠재갭 LOW→선반영). **85 통과/0 실패, fmt clean, clippy 13(신규 0)**. 기존 테스트 1개(`market_latency_details_include_gate_context`) 의도적 수정(기준이 open→close로 이동해 received_at +60s)
 - **함정 기록**: ⚠️**latency≠open_time 기준**(캔들은 close_time 기준이어야 정상틱이 fresh). 1m 캔들 경계틱도 open_time 기준이면 7-10초. 적대적 리뷰가 머니게이트에서 결정적(초기 진단 반증). DB 증거 우선(risk_events/candles/order_books). **타임아웃 트레이드오프**: 캔들 staleness 탐지창이 ~2s→~interval+2s(1m=62s)로 넓어짐(의도된 것, 실제 freeze 탐지는 오더북 경로+새 캔들 부재로)
 
-## 🚀 다음 세션 첫 액션 — ★새 전략 만들기 (clear 후 여기부터)
-**트리거 문구: "rust 트레이딩 새 전략 만들자"** (또는 "rust 트레이딩 이어서 작업")
+## 🚀 다음 세션 첫 액션 — ★변동성돌파 전략 구현 (clear 후 여기부터)
+**트리거 문구: "rust 변동성돌파 전략 구현 이어서"** (또는 "rust 트레이딩 이어서 작업")
 
-### 0. 그린 베이스라인 확인 (먼저)
-- `set -a; source .env; set +a; export TEST_DATABASE_URL=$(echo "$DATABASE_URL" | sed 's#/trading_system$#/trading_system_test#')`
-- `cargo test --workspace` → **103 passed / 0 failed**(병렬 OK, flaky 해소됨), `cargo fmt --all -- --check`=clean, clippy warning 1(기존 `ai_repository.rs:83` 인자수)
-- git `main` = `df37ec7` 동기화 완료. ⚠️git 루트=부모 `~/Documents/Rust`. ⚠️.env 커밋 금지. DB테스트는 `TEST_DATABASE_URL` 필요(로컬 `trading_system_test`).
-- 봇은 직전 세션에 kill됨(실행 중 아님). 미결 testnet 포지션 0(sweep로 정리됨).
+> **현재 위치**: 설계·데이터분석·spec 커밋 **완료**, **구현 직전**. 브레인스토밍/설계는 끝났으니
+> 다시 안 해도 됨. 아래 0~3 순서대로 **바로 구현** 들어가면 됨. spec이 단일 진실원천.
 
-### 1. 전략 시스템 구조 (★새 전략은 여기만 건드림 — 엔진 불변)
-- **전부 `crates/strategy/src/lib.rs` 한 파일** (~6KB). 핵심은 trait 1개:
-  ```rust
-  pub trait Strategy: Send + Sync {
-      fn name(&self) -> &'static str;
-      fn evaluate(&self, candles: &[Candle]) -> Vec<Signal>;  // 입력=캔들, 출력=시그널(매수/매도/없음)
-  }
-  ```
-- **현재 전략 = `TechnicalStrategy`** (RSI+볼린저 듀얼컨펌): 매수=`RSI≤30 && 종가≤볼린저하단`, 매도=`RSI≥70 && 종가≥볼린저상단`. 파라미터(rsi_period14·bollinger20·임계30/70)는 `Default`에 하드코딩. `score`=임계값 이탈폭(신호강도). AI 필터는 OFF(`ai_filter:false`, 순수 룰).
-- 헬퍼 이미 있음: `calculate_rsi`, `calculate_bollinger_bands`, `closes_as_f64`, `build_signal`, `score_from_distance`.
-- **시그널→주문 흐름**: `evaluate()`→리스크게이트(latency/일일손실/lock)→testnet 시장주문 체결→SL/TP 보호주문(Algo API). **전략은 방향만 결정, 주문/보호/리스크는 엔진이 처리**(돈 실수 여지 없음).
+### ★ spec 문서 (모든 결정·근거가 여기 = 먼저 읽기)
+`docs/superpowers/specs/2026-06-15-volatility-breakout-strategy-design.md` (커밋 `8ab8f50`)
 
-### 2. 새 전략 만드는 절차 (TDD)
-1. `lib.rs`에 새 struct(예: `MaCrossStrategy`) + `impl Strategy` 작성. 지표계산→조건→`build_signal`.
-2. 단위 테스트 먼저(RED): 알려진 캔들 시퀀스 → 기대 시그널. lib.rs 하단 `#[cfg(test)]`에 기존 RSI 테스트 패턴 참고.
-3. 런타임에서 `TechnicalStrategy::default()` 쓰는 곳을 새 전략으로 교체 (testnet=`testnet_runtime.rs:71`, 백테스트/paper 경로도 확인).
-4. **백테스트 검증**: 과거 캔들 import(`import_historical_candles` bin) → `POST /api/backtest-runs/run` → `max_drawdown_pct`/trade수 확인. (runbook.md "Backtesting" 섹션 참고)
-5. testnet 라이브 검증(원하면). 봇 실행: `set -a; source .env; set +a && RUST_LOG=trading_api=debug,info cargo run -p trading-api --bin trading-api`
+### 0. 그린 베이스라인 확인 (먼저, 복붙)
+```bash
+cd ~/Documents/Rust/trading-system
+set -a; source .env; set +a
+export TEST_DATABASE_URL=$(echo "$DATABASE_URL" | sed 's#/trading_system$#/trading_system_test#')
+cargo test --workspace        # 기대: 103 passed / 0 failed (실측 확인됨 2026-06-15)
+```
+- `cargo fmt --all -- --check`=clean, clippy warning 1(기존 `ai_repository.rs:83` 인자수, 신규 아님)
+- ⚠️git 루트=부모 `~/Documents/Rust` (커밋은 거기서, 경로는 `trading-system/...`). ⚠️.env 커밋 금지.
+- 봇 실행 중 아님. 미결 testnet 포지션 0.
 
-### 3. 전략 고도화 시 마주칠 구조적 한계 (미리 알아둘 것)
-- `evaluate()`가 **캔들만** 받음 → 오더북/펀딩비/외부데이터 쓰려면 trait 인터페이스 확장 필요
-- **최신 캔들만 보고 판단** → 포지션 보유상태/진입가 모름(엔진의 SL/TP가 청산 담당). "보유 중 트레일링" 같은 건 현 구조론 전략이 못 함
-- 파라미터 하드코딩 → 튜닝하려면 설정화(env/config) 필요
-- 단일 심볼 독립 평가 → 페어트레이딩 등 멀티심볼은 구조 확장 필요
+### 1. 구현 대상 — `VolatilityBreakoutStrategy` (양방향 변동성돌파, 엔진 불변)
+- **파일**: `crates/strategy/src/lib.rs` 한 파일에 새 struct + `impl Strategy` 추가 (기존 `TechnicalStrategy`는 그대로 둠).
+- **로직** (spec §3): 직전 `lookback`(=20)봉 레인지 `range=max(high)-min(low)` × `k`(=0.5)를 돌파봉 시가에 가감.
+  - `latest.close >= open + range*k` → **Buy**, `latest.close <= open - range*k` → **Sell**, 아니면 무신호.
+  - window = `candles[len-1-lookback .. len-1]` (latest **제외** — 자기돌파 방지). `range==0`이면 무신호.
+  - 돌파 판정 = **종가**(close, 확정 돌파. 고가 아님 — whipsaw 방지).
+  - `Default { lookback: 20, k: 0.5 }`, `name()="volatility_breakout"`.
+- **헬퍼 재사용**(중복구현 금지): `build_signal`, `score_from_distance`. high/low f64변환은 `ToPrimitive::to_f64`(기존 `closes_as_f64` 패턴), 실패 시 무신호.
 
-### 4. 사용자 결정사항 (이번 세션 합의)
-- **AI 없이 룰 기반으로 운영** (비용0·재현성·백테스트 신뢰도). AI 필터는 나중에 선택적으로.
-- 직접 전략 설계·백테스트·튜닝 하기로 함.
+### 2. 구현 순서 (TDD — RED→GREEN)
+1. **테스트 먼저(RED)**: lib.rs 하단 `#[cfg(test)]`에 신규 6개 + `candle_hlc(idx, h, l, c)` 헬퍼 추가. 목록=spec §7:
+   `does_not_signal_with_insufficient_history` / `signals_buy_on_upside_breakout` / `signals_sell_on_downside_breakout` / `no_signal_inside_band` / `no_signal_on_zero_range` / `score_grows_with_breakout_distance`.
+2. **구현(GREEN)**: `evaluate()` 작성 → 6개 통과.
+3. **런타임 교체 2줄**: `testnet_runtime.rs:71` + `strategy_runtime.rs:65`의 `TechnicalStrategy::default()` → `VolatilityBreakoutStrategy::default()`. (호출부·backtest는 trait 경유라 무수정)
+4. **전체 검증**: `cargo test --workspace` → **109 passed / 0 failed** 기대. fmt clean, clippy 신규 0. `cargo build -p trading-api` 성공.
+
+### 3. 백테스트 검증 (구현 후 — import 불필요!)
+- ⚠️ **DB에 binance BTC/ETH 1m 캔들 3년치(2023-06-13~) 이미 적재됨** → `import_historical_candles` 안 돌려도 됨 (2026-06-15 DB 조회 확인).
+- 최근 6개월 BTC·ETH 리플레이 → trade수·수익률·`max_drawdown_pct` 산출 → PROGRESS.md 기록. ⚠️`BACKTEST_HISTORY_LIMIT=64`라 lookback≤50 유지.
+- **사용자 미결정**: 백테스트까지만 멈출지 / testnet 라이브까지 갈지 → 백테스트 결과 보고 사용자에게 물어볼 것.
+
+### 4. 사용자 결정사항 (확정 — 재논의 불필요)
+- **양방향(롱+숏)** 변동성돌파. (데이터 근거: 최근 6mo BTC -29%·ETH -48%·모멘텀약함·돌파적중률<50% → 롱전용은 엣지없음. spec §2)
+- **AI 없이 룰 기반**. 정통 일봉 래리윌리엄스는 **버퍼 100캔들 제약상 불가**(엔진수정 필요) → 롤링 N봉 변형 채택.
+- 파라미터 하드코딩(설정화는 후속). `evaluate()`는 캔들만 받음·최신캔들만 판단(구조적 한계, spec §9).
 
 ### 참고: 남은 후속(전략과 별개, 선택) — 아래 "재개 지점" 참조
 주기적 position sweep(현재 기동 시 1회만), signal.id 안정화, timeframe CI 가드. **급한 버그 없음.**
