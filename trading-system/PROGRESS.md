@@ -1,6 +1,6 @@
 # PROGRESS — trading-system (Rust 코인선물 AI 트레이딩)
 
-> 마지막 갱신: 2026-06-16 (📡**가격방향 종료 후 → 오더북-임밸런스 가설용 장기 캐처 방향(사용자 선택)**. 선결과제=per-stream 오더북 staleness 재연결 근본수정 **완료·푸시 `6056de3`**(partial-stall 버그=장기 캐처 데이터 손상 방지, TDD+적대적리뷰 2회·129 passed). **다음=캐처 배포위치 결정(Hetzner 권장)→`.env` 캐처-only 전환→가동→몇 주 후 imbalance 사전등록 분석**. 상세=「📡 진행 중」섹션. ▼이전: 🛑**가격방향 탐색 종료**(4계열 falsify 수용, 검증 인프라 영구 보존). 상세=🛑 박스. ▼더 이전: ★★★**일봉(1d) 돌파도 effectively-FAIL — 돌파/평균회귀 계열 4번째 falsify, BTC/ETH 2023-26 레짐에서 가격방향 엣지 없음 확정**. 1d WFO 3윈도우(IS12mo→OOS6mo, 60일 pre-roll, n=3 verdict) 실행: 기계판정=INCONCLUSIVE(2윈도우 floor미달)였으나, **풀링하면 powered FAIL**: 53거래·15승(28.3%)·1x PnL−66.46·P(≤15승|공정동전)=0.0011. floor 미달 윈도우 둘 다 0근처 아닌 **유의한 음수**(−46.89/−29.51)라 floor가 증거를 은폐 중이었음. 유일 양수 W3(+9.94)은 2×비용서 −0.08 사망. IS-best 3개 다 음수+파라미터 텔레포트=오버핏 시그니처. 라이브 불변). **★★다음 세션=구조적으로 다른(가격방향이 아닌) 가설 or 멈춤** — "🚀 다음 세션 첫 액션" 읽기. ⭐일봉 검증 인프라(pre-roll `eval_start`·n=3 verdict·1d 롤업)는 영구 유지, 커밋됨.
+> 마지막 갱신: 2026-06-16 (📡**오더북-임밸런스 가설용 장기 캐처 — 선결 코드 3건 완료·푸시**: per-stream staleness 재연결(`6056de3`)+무거래 템플릿(`7f05862`)+1초 다운샘플(`2536828`). 거래/전략/캔들/latency 경로 전부 불변(적대적 검증). 133 passed. **결정 완료(사용자)**: 배포=**Hetzner**, 저장=**1초 샘플링**(Hetzner 63G 여유라 raw면 ~2주 꿉참). **다음=Hetzner 배포**(PG에 trading_system DB 생성→바이너리 배포⚠️SSH docker build금지→capture-only.env→가동·모니터). 상세=「📡 진행 중」섹션. ▼이전: 🛑**가격방향 탐색 종료**(4계열 falsify 수용, 검증 인프라 영구 보존). 상세=🛑 박스. ▼더 이전: ★★★**일봉(1d) 돌파도 effectively-FAIL — 돌파/평균회귀 계열 4번째 falsify, BTC/ETH 2023-26 레짐에서 가격방향 엣지 없음 확정**. 1d WFO 3윈도우(IS12mo→OOS6mo, 60일 pre-roll, n=3 verdict) 실행: 기계판정=INCONCLUSIVE(2윈도우 floor미달)였으나, **풀링하면 powered FAIL**: 53거래·15승(28.3%)·1x PnL−66.46·P(≤15승|공정동전)=0.0011. floor 미달 윈도우 둘 다 0근처 아닌 **유의한 음수**(−46.89/−29.51)라 floor가 증거를 은폐 중이었음. 유일 양수 W3(+9.94)은 2×비용서 −0.08 사망. IS-best 3개 다 음수+파라미터 텔레포트=오버핏 시그니처. 라이브 불변). **★★다음 세션=구조적으로 다른(가격방향이 아닌) 가설 or 멈춤** — "🚀 다음 세션 첫 액션" 읽기. ⭐일봉 검증 인프라(pre-roll `eval_start`·n=3 verdict·1d 롤업)는 영구 유지, 커밋됨.
 
 ## 🛑 결정 — 가격방향 탐색 정직하게 종료 (2026-06-16, 사용자 확정)
 **트리거 문구: "rust 트레이딩 이어서 작업" → 먼저 이 박스를 읽을 것**
@@ -17,14 +17,20 @@
 > **방향(사용자 선택 2026-06-16)**: 멈춤 직후, 가격방향과 **직교한** 후속으로 **오더북 top-of-book 불균형(imbalance) 가설**을 노리기로 함. 단 검증하려면 데이터가 필요한데 DB 실측 결과:
 > - `funding_rates` 테이블 없음 → 펀딩비/캐리 가설은 데이터 적재부터(보류).
 > - `order_books`는 **62시간치뿐**(2026-06-13~15, top-of-book: best_bid/ask+size). 정직한 walk-forward OOS엔 **몇 주~몇 달 무중단 캐처** 필요.
-> **★선결과제 완료(`6056de3`)**: 그냥 봇을 재가동하면 기록된 **partial-stall 버그**로 ~40분 뒤 데이터가 조용히 손상됨 → **per-stream 오더북 staleness 재연결을 근본수정**(TDD+적대적리뷰 2회, 메모리 파일 참조). 이제 장기 캐처가 신뢰 가능.
+> **★선결 코드 작업 완료(커밋 모두 푸시)**:
+> - **per-stream 오더북 staleness 재연결**(`6056de3`): partial-stall 버그(오더북만 죽고 ping/kline 트리클이 idle 타이머 영구 리셋) 근본수정 + connect-time 앵커(재연결 후 오더북 영영 안 와도 잡힘). TDD+적대적리뷰 2회.
+> - **무거래 캐처 템플릿**(`7f05862`): `configs/capture-only.env`(`cp` 한 줄로 무주문 캐처).
+> - **1초 다운샘플**(`2536828`): `MARKET_DATA_ORDERBOOK_SAMPLE_SECS`(기본 0=전부, 캐처는 1)로 (거래소,심볼)당 초당 1행만 `order_books` 적재. 디스크 ~50-100배↓. **거래/전략 포워더/캔들/latency 경로 불변**(적대적 7항목 라인검증). TDD.
 >
-> **🚀 다음 세션 첫 액션 (순서대로)**:
-> 1. **배포 위치 결정(사용자)**: 맥북은 절전 freeze라 몇 주 무중단 부적합 → **Hetzner(5.161.112.248) 권장**. ⚠️결정 필요: ①어디서 돌릴지 ②`order_books` append-only·pruning 없음(수만행/분)→디스크/리텐션 정책 ③Hetzner면 캐처가 쓸 DB 위치(현재 DB는 맥북 로컬 `127.0.0.1`).
-> 2. **`.env`를 캐처-only(무거래)로 전환**: 체크인된 템플릿 사용 → `cp configs/capture-only.env .env` 후 DATABASE_URL/대시보드 시크릿만 채움. (현재 `.env`는 `TRADING_MODE=testnet`=주문 발생! 템플릿은 `paper`+`PAPER_TRADING_ENABLED=false`+`BINANCE_TESTNET_ENABLED=false`+`MARKET_DATA_ENABLED=true`=주문 0·캐처만, 소스검증·헤더에 근거.)
-> 3. **캐처 가동 + 헬스 모니터**: `RUST_LOG=trading_api=info cargo run -p trading-api --bin trading-api`. 분당 `order_books` insert rate / `MAX(event_time)` 모니터(절벽 탐지). staleness 수정으로 partial-stall은 자가복구되나, 외부 watchdog는 안전망(선택).
-> 4. **데이터 충분해지면**(몇 주 후): 오더북 imbalance 가설을 **사전등록 데이터분석부터**(imbalance가 다음 N틱 수익률/체결을 예측하는가? IC·분위수) → 신호 있으면 전략 구현+동일 WFO+OOS+수수료+적대적리뷰, 없으면 근거 있는 기각. ⚠️같은 family-wise 규율.
-> **⚠️비차단 한계(캐처엔 무방, 라이브 전 재검토)**: bybit `tickers.*`=델타채널→top-of-book 안 변해도 staleness 클럭 갱신됨. 백프레셔(DB 멈춤) 동안 탐지 지연. 상세=메모리 파일.
+> **★결정 완료(사용자 2026-06-16)**: 배포=**Hetzner**(`5.161.112.248`)에 캐처+DB 함께. 저장=**1초 샘플링**(풀해상도 raw 대신 — Hetzner 디스크 63G 여유뿐, raw면 ~2주에 꿉참; 1초면 몇 달 OK). 리텐션 정책=1초 샘플링으로 해소(추가 프루닝 불필요).
+>
+> **🚀 다음 세션 첫 액션 — Hetzner 캐처 배포 (순서대로)**:
+> 1. **Hetzner 점검 재확인**(이미 1회 함, 2026-06-16): 디스크 150G 중 63G 여유, mem 7.6G(4G avail), Postgres 컨테이너 4개 가동중이나 **trading_system DB는 없음**(맥북 로컬에만 존재). → 캐처용 Postgres를 Hetzner에 새로 띄우거나 기존 PG에 `trading_system` DB 생성 + 마이그레이션(`RUN_MIGRATIONS=true`가 자동 적용) 결정.
+> 2. **Rust 바이너리 배포**: ⚠️**함정=SSH에서 docker build 금지**(credsStore desktop, 메모리 기록) → schtasks/로컬빌드 후 이미지 푸시 등 우회 필요. 또는 Hetzner에서 직접 `cargo build --release`(rust 툴체인 확인).
+> 3. **`.env`=capture-only**: `cp configs/capture-only.env .env`, DATABASE_URL=Hetzner PG, 대시보드 시크릿 채움. (`MARKET_DATA_ORDERBOOK_SAMPLE_SECS=1` 이미 템플릿에 있음.)
+> 4. **가동 + 헬스 모니터**: `RUST_LOG=trading_api=info`. 분당 `order_books` insert rate / `MAX(event_time)` 모니터(절벽=stall 탐지). 디스크 증가율도 모니터(1초 샘플링이 예상대로 ~50-100MB/일급인지 확인).
+> 5. **데이터 충분해지면**(몇 주 후): imbalance 가설을 **사전등록 데이터분석부터**(imbalance가 다음 N분 수익률 예측? IC·분위수) → 신호 있으면 전략 구현+동일 WFO+OOS+수수료+적대적리뷰, 없으면 근거 있는 기각. ⚠️같은 family-wise 규율.
+> **⚠️비차단 한계(캐처엔 무방, 라이브 전 재검토)**: bybit `tickers.*`=델타채널→top-of-book 안 변해도 staleness/샘플 갱신됨. 백프레셔(DB 멈춤) 동안 staleness 탐지 지연. 상세=메모리 파일.
 
 ### 🚀 (참고·보존) 멈춤 직전 다음 액션 메모 — ★가격방향이 아닌 구조적으로 다른 가설, or 멈춤
 
