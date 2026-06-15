@@ -1405,17 +1405,22 @@ mod tests {
     /// timeframe. Returns nothing; prints diagnostics + a three-way verdict.
     async fn walk_forward_breakout_for_timeframe(pool: &PgPool, timeframe: &str) {
         let grid = walk_forward_grid();
+        // OOS widened to 3 months (vs the 1m harness's 2). This is NOT a results-
+        // driven rule change: the prior 1h run was INCONCLUSIVE because window 2
+        // had only 16 trades (< the 20 floor); a 3mo OOS lifts every window above
+        // the floor (W2 ~24 trades) WITHOUT touching the entry grid. IS length,
+        // window count, and the grid are unchanged. W4 still clamps to "now".
         let windows: [(i32, u32, i32, u32, i32, u32); 4] = [
-            (2024, 6, 2024, 10, 2024, 12),
-            (2025, 1, 2025, 5, 2025, 7),
-            (2025, 8, 2025, 12, 2026, 2),
-            (2026, 1, 2026, 5, 2026, 7),
+            (2024, 6, 2024, 10, 2025, 1),
+            (2025, 1, 2025, 5, 2025, 8),
+            (2025, 8, 2025, 12, 2026, 3),
+            (2026, 1, 2026, 5, 2026, 8),
         ];
         let now = Utc::now();
 
         eprintln!(
             "\n############ timeframe = {timeframe} ############\n\
-             grid = {} combos, 4 windows IS 4mo -> OOS 2mo, BTC+ETH, fee-aware, \
+             grid = {} combos, 4 windows IS 4mo -> OOS 3mo, BTC+ETH, fee-aware, \
              min trades/window = {}.",
             grid.len(),
             MR_MIN_TRADES,
