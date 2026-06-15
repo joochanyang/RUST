@@ -5,9 +5,27 @@ use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use trading_core::{Candle, ExchangeId, PositionSide, Result, Signal, Symbol, TradingError};
 use trading_risk::{AccountRiskState, BasicRiskGate, RiskGate};
-use trading_strategy::{Strategy, VolatilityBreakoutStrategy};
+use trading_strategy::{Strategy, TrendFilteredBreakoutStrategy};
 
 const BACKTEST_HISTORY_LIMIT: usize = 64;
+
+/// Per-side taker fee charged on notional (0.04%, Binance USDT-M futures taker).
+/// Backtest-only: live/paper PnL (`execution_repository::paper_position_pnl`) is
+/// untouched. See the design spec — exits assume idealized fills, so funding and
+/// gap-through remain unmodeled; a passing OOS is necessary, not sufficient.
+const BACKTEST_TAKER_FEE: Decimal = Decimal::from_parts(4, 0, 0, false, 4); // 0.0004
+/// Per-side slippage as a fraction of notional (0.01%). Understates gap-through
+/// at the exact moment a stop fires; treat OOS results as optimistic.
+const BACKTEST_SLIPPAGE_PCT: Decimal = Decimal::from_parts(1, 0, 0, false, 4); // 0.0001
+
+/// Round-trip cost (entry + exit) for one trade: both legs charged taker fee +
+/// slippage on their respective notional. Returns a positive Decimal to subtract
+/// from the trade's PnL.
+fn trade_cost(entry_price: Decimal, exit_price: Decimal, quantity: Decimal) -> Decimal {
+    let entry_notional = entry_price * quantity;
+    let exit_notional = exit_price * quantity;
+    (entry_notional + exit_notional) * (BACKTEST_TAKER_FEE + BACKTEST_SLIPPAGE_PCT)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BacktestConfig {
@@ -18,10 +36,12 @@ pub struct BacktestConfig {
     pub period_end: Option<DateTime<Utc>>,
     pub initial_equity: Option<Decimal>,
     pub daily_loss_limit: Option<Decimal>,
-    /// Volatility-breakout strategy parameters. When omitted, the strategy's
-    /// own defaults (lookback 20, k 0.5) apply. Used for walk-forward sweeps.
+    /// Trend-filtered breakout parameters. When omitted, the strategy's own
+    /// defaults (lookback 20, k 0.5, ma_period 50) apply. Used for walk-forward
+    /// sweeps — the only config-injected strategy params (see spec §8).
     pub lookback: Option<usize>,
     pub k: Option<f64>,
+    pub ma_period: Option<usize>,
 }
 
 impl BacktestConfig {
@@ -43,6 +63,7 @@ impl BacktestConfig {
             daily_loss_limit: Some(self.daily_loss_limit.unwrap_or(Decimal::new(500, 0))),
             lookback: self.lookback,
             k: self.k,
+            ma_period: self.ma_period,
         }
     }
 
@@ -126,12 +147,13 @@ pub async fn run_backtest(pool: &PgPool, config: BacktestConfig) -> Result<Backt
         ));
     }
 
-    let default_strategy = VolatilityBreakoutStrategy::default();
-    let strategy = match (config.lookback, config.k) {
-        (None, None) => default_strategy,
-        (lookback, k) => VolatilityBreakoutStrategy::new(
+    let default_strategy = TrendFilteredBreakoutStrategy::default();
+    let strategy = match (config.lookback, config.k, config.ma_period) {
+        (None, None, None) => default_strategy,
+        (lookback, k, ma_period) => TrendFilteredBreakoutStrategy::new(
             lookback.unwrap_or_else(|| default_strategy.lookback()),
             k.unwrap_or_else(|| default_strategy.k()),
+            ma_period.unwrap_or_else(|| default_strategy.ma_period()),
         ),
     };
     let risk_gate = BasicRiskGate::default();
@@ -189,7 +211,10 @@ pub async fn run_backtest(pool: &PgPool, config: BacktestConfig) -> Result<Backt
             .rev()
             .find(|candle| candle.symbol == position.symbol)
         {
-            equity += position_pnl(position, last_candle.close);
+            // Mark-to-close the leftover position, also net of round-trip cost
+            // (win/loss counters intentionally untouched here, as before).
+            equity += position_pnl(position, last_candle.close)
+                - trade_cost(position.entry_price, last_candle.close, position.quantity);
         }
     }
 
@@ -309,7 +334,11 @@ fn close_positions(
             index += 1;
             continue;
         };
-        let pnl = position_pnl(&open_positions[index], exit_price);
+        let position = &open_positions[index];
+        // Charge round-trip fee + slippage; win/loss is judged on after-cost PnL
+        // so a trade that only profits before fees is correctly counted a loss.
+        let pnl = position_pnl(position, exit_price)
+            - trade_cost(position.entry_price, exit_price, position.quantity);
         *equity += pnl;
         *trades += 1;
         if pnl >= Decimal::ZERO {
@@ -357,7 +386,7 @@ pub fn metrics_to_json(metrics: &BacktestMetrics) -> serde_json::Value {
 }
 
 pub fn strategy_version() -> &'static str {
-    "volatility_breakout_v1"
+    "trend_filtered_breakout_v1"
 }
 
 #[cfg(test)]
@@ -395,6 +424,26 @@ mod tests {
         range.high = Decimal::new(103, 0);
 
         assert_eq!(exit_price(&position, &range), Some(Decimal::new(99, 0)));
+    }
+
+    #[test]
+    fn trade_cost_charges_both_legs_fee_and_slippage() {
+        // entry 100, exit 110, qty 2.
+        // entry_notional = 200, exit_notional = 220, sum = 420.
+        // rate = taker 0.0004 + slippage 0.0001 = 0.0005.
+        // cost = 420 * 0.0005 = 0.21.
+        let cost = trade_cost(
+            Decimal::new(100, 0),
+            Decimal::new(110, 0),
+            Decimal::new(2, 0),
+        );
+        assert_eq!(cost, Decimal::new(21, 2)); // 0.21
+    }
+
+    #[test]
+    fn trade_cost_is_zero_for_zero_quantity() {
+        let cost = trade_cost(Decimal::new(100, 0), Decimal::new(110, 0), Decimal::ZERO);
+        assert_eq!(cost, Decimal::ZERO);
     }
 
     #[test]

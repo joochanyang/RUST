@@ -194,6 +194,137 @@ impl Strategy for VolatilityBreakoutStrategy {
     }
 }
 
+/// Trend-filtered volatility breakout. Wraps the same rolling-window breakout
+/// logic as [`VolatilityBreakoutStrategy`] but only emits a signal when the
+/// breakout direction agrees with a longer simple-moving-average trend gate:
+/// a Buy needs `close > SMA`, a Sell needs `close < SMA`. Breakouts that fight
+/// the trend (the whipsaw case the pure breakout could not avoid) are dropped.
+///
+/// The MA gate is a falsification probe, not a guaranteed edge — see the design
+/// spec. With the live buffer capped at 100 candles, `ma_period` is bounded to a
+/// short horizon (≤ ~50), so on 1m candles this is a minutes-scale momentum gate.
+#[derive(Debug, Clone)]
+pub struct TrendFilteredBreakoutStrategy {
+    lookback: usize,
+    k: f64,
+    ma_period: usize,
+}
+
+impl TrendFilteredBreakoutStrategy {
+    /// Constructs the strategy with explicit parameters. Used by the backtest
+    /// runner for walk-forward sweeps; live runtimes use `default()`.
+    pub fn new(lookback: usize, k: f64, ma_period: usize) -> Self {
+        Self {
+            lookback,
+            k,
+            ma_period,
+        }
+    }
+
+    pub fn lookback(&self) -> usize {
+        self.lookback
+    }
+
+    pub fn k(&self) -> f64 {
+        self.k
+    }
+
+    pub fn ma_period(&self) -> usize {
+        self.ma_period
+    }
+}
+
+impl Default for TrendFilteredBreakoutStrategy {
+    fn default() -> Self {
+        Self::new(20, 0.5, 50)
+    }
+}
+
+impl Strategy for TrendFilteredBreakoutStrategy {
+    fn name(&self) -> &'static str {
+        "trend_filtered_breakout"
+    }
+
+    fn evaluate(&self, candles: &[Candle]) -> Vec<Signal> {
+        // Warmup: need enough candles for both the breakout window and the MA.
+        let need = (self.lookback + 1).max(self.ma_period);
+        if candles.len() < need {
+            return Vec::new();
+        }
+
+        let latest = match candles.last() {
+            Some(candle) => candle,
+            None => return Vec::new(),
+        };
+
+        let window = &candles[candles.len() - 1 - self.lookback..candles.len() - 1];
+        let (highest, lowest) = match window_high_low(window) {
+            Some(values) => values,
+            None => return Vec::new(),
+        };
+        let range = highest - lowest;
+        if range <= 0.0 {
+            return Vec::new();
+        }
+
+        let open = match latest.open.to_f64() {
+            Some(value) => value,
+            None => return Vec::new(),
+        };
+        let close = match latest.close.to_f64() {
+            Some(value) => value,
+            None => return Vec::new(),
+        };
+
+        let closes = match closes_as_f64(candles) {
+            Some(values) => values,
+            None => return Vec::new(),
+        };
+        // None (conversion failure / too-short slice) is treated as no signal,
+        // matching every other None branch — never unwrap on the live path.
+        let ma = match simple_moving_average(&closes, self.ma_period) {
+            Some(value) => value,
+            None => return Vec::new(),
+        };
+
+        let offset = range * self.k;
+        let long_target = open + offset;
+        let short_target = open - offset;
+
+        // Trend gate: a breakout signal only survives if it agrees with the MA.
+        // `close == ma` is undecided → no signal (strict inequality, pinned by test).
+        if close >= long_target && close > ma {
+            return vec![build_signal(
+                latest,
+                Side::Buy,
+                self.name(),
+                score_from_distance(close - long_target),
+                format!(
+                    "Close {close:.2} broke above volatility target {long_target:.2} \
+                     with uptrend (SMA{ma_period} {ma:.2})",
+                    ma_period = self.ma_period
+                ),
+            )];
+        }
+
+        if close <= short_target && close < ma {
+            return vec![build_signal(
+                latest,
+                Side::Sell,
+                self.name(),
+                score_from_distance(short_target - close),
+                format!(
+                    "Close {close:.2} broke below volatility target {short_target:.2} \
+                     with downtrend (SMA{ma_period} {ma:.2})",
+                    ma_period = self.ma_period
+                ),
+            )];
+        }
+
+        Vec::new()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct BollingerBands {
     upper: f64,
@@ -242,6 +373,18 @@ fn window_high_low(candles: &[Candle]) -> Option<(f64, f64)> {
     } else {
         None
     }
+}
+
+/// Simple moving average of the most recent `period` closes. Returns `None`
+/// when there are fewer than `period` values or `period` is zero. The window is
+/// `closes[len - period..]` — the latest close is included (unlike the breakout
+/// window, which excludes it). Off-by-one here is pinned by a value-asserting test.
+fn simple_moving_average(closes: &[f64], period: usize) -> Option<f64> {
+    if period == 0 || closes.len() < period {
+        return None;
+    }
+    let window = &closes[closes.len() - period..];
+    Some(window.iter().sum::<f64>() / period as f64)
 }
 
 fn calculate_rsi(closes: &[f64], period: usize) -> Option<f64> {
@@ -417,6 +560,128 @@ mod tests {
         assert_eq!(small.len(), 1);
         assert_eq!(large.len(), 1);
         assert!(large[0].score > small[0].score);
+    }
+
+    // --- TrendFilteredBreakoutStrategy ---------------------------------------
+    //
+    // Tests use a small ma_period via `new()` so the warmup guard
+    // (need = max(lookback+1, ma_period)) does not silently swallow the signal
+    // and make a broken gate look green. lookback=5, ma_period=5 → need=6.
+
+    /// Flat reference window of `lookback` candles at `mid` with a fixed
+    /// high/low range, followed by a breakout candle. All closes sit at `mid`
+    /// except the breakout, so the SMA over the recent window is ~mid and the
+    /// gate is driven by where the breakout close lands relative to mid.
+    fn trend_window(lookback: usize, mid: i64, range: i64) -> Vec<Candle> {
+        (0..lookback as i64)
+            .map(|index| candle_hlc(index, mid, mid + range / 2, mid - range / 2, mid))
+            .collect()
+    }
+
+    #[test]
+    fn trend_filter_does_not_signal_with_insufficient_history() {
+        // need = max(lookback+1, ma_period) = max(6, 5) = 6; supply only 5.
+        let candles = trend_window(5, 50_000, 100);
+        assert!(TrendFilteredBreakoutStrategy::new(5, 0.5, 5)
+            .evaluate(&candles)
+            .is_empty());
+    }
+
+    #[test]
+    fn trend_filter_allows_long_above_ma() {
+        // window range 100, k 0.5 → offset 50. Breakout open 50_000, close 50_060
+        // (> 50_050 target). SMA of recent closes ≈ 50_000, close 50_060 > SMA → Buy.
+        let mut candles = trend_window(5, 50_000, 100);
+        candles.push(candle_hlc(5, 50_000, 50_060, 49_990, 50_060));
+
+        let signals = TrendFilteredBreakoutStrategy::new(5, 0.5, 5).evaluate(&candles);
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].side, Side::Buy);
+    }
+
+    #[test]
+    fn trend_filter_blocks_long_below_ma() {
+        // Upside breakout in price terms, but the prior closes are high enough
+        // that the SMA sits ABOVE the breakout close → trend disagrees → blocked.
+        // Reference closes at 50_200 (range still 100), breakout open 50_000 so
+        // offset target = 50_050; close 50_060 clears the target but 50_060 < SMA
+        // (~50_180) → no Buy.
+        let mut candles: Vec<Candle> = (0..5)
+            .map(|index| candle_hlc(index, 50_200, 50_250, 50_150, 50_200))
+            .collect();
+        candles.push(candle_hlc(5, 50_000, 50_060, 49_990, 50_060));
+
+        assert!(TrendFilteredBreakoutStrategy::new(5, 0.5, 5)
+            .evaluate(&candles)
+            .is_empty());
+    }
+
+    #[test]
+    fn trend_filter_allows_short_below_ma() {
+        // Symmetric downside: close 49_940 (< 49_950 short target) and below SMA → Sell.
+        let mut candles = trend_window(5, 50_000, 100);
+        candles.push(candle_hlc(5, 50_000, 50_010, 49_940, 49_940));
+
+        let signals = TrendFilteredBreakoutStrategy::new(5, 0.5, 5).evaluate(&candles);
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].side, Side::Sell);
+    }
+
+    #[test]
+    fn trend_filter_blocks_short_above_ma() {
+        // Downside breakout in price terms, but prior closes low so SMA sits BELOW
+        // the breakout close → trend disagrees → blocked.
+        let mut candles: Vec<Candle> = (0..5)
+            .map(|index| candle_hlc(index, 49_800, 49_850, 49_750, 49_800))
+            .collect();
+        candles.push(candle_hlc(5, 50_000, 50_010, 49_940, 49_940));
+
+        assert!(TrendFilteredBreakoutStrategy::new(5, 0.5, 5)
+            .evaluate(&candles)
+            .is_empty());
+    }
+
+    #[test]
+    fn trend_filter_no_signal_inside_band() {
+        // close 50_030 between short target 49_950 and long target 50_050 → no breakout.
+        let mut candles = trend_window(5, 50_000, 100);
+        candles.push(candle_hlc(5, 50_000, 50_040, 49_970, 50_030));
+
+        assert!(TrendFilteredBreakoutStrategy::new(5, 0.5, 5)
+            .evaluate(&candles)
+            .is_empty());
+    }
+
+    #[test]
+    fn trend_filter_blocks_on_close_equals_ma() {
+        // Upside breakout whose close lands EXACTLY on the SMA. With all six
+        // closes equal to 50_050, SMA = 50_050 and the breakout close = 50_050,
+        // so close == ma → undecided → no signal. A `>=` transcription error
+        // would wrongly emit a Buy here.
+        let mut candles: Vec<Candle> = (0..5)
+            .map(|index| candle_hlc(index, 50_050, 50_100, 50_000, 50_050))
+            .collect();
+        // window range = 100, k 0.5 → offset 50, open 50_000 → long target 50_050.
+        candles.push(candle_hlc(5, 50_000, 50_050, 49_990, 50_050));
+
+        let strategy = TrendFilteredBreakoutStrategy::new(5, 0.5, 5);
+        // close (50_050) >= long target (50_050) is true, but close == ma → blocked.
+        assert!(strategy.evaluate(&candles).is_empty());
+    }
+
+    #[test]
+    fn simple_moving_average_computes_expected_value() {
+        let closes = [10.0, 20.0, 30.0, 40.0, 50.0];
+        // period 3 → mean of last three (30,40,50) = 40.
+        assert_eq!(simple_moving_average(&closes, 3), Some(40.0));
+        // period equal to len → mean of all = 30.
+        assert_eq!(simple_moving_average(&closes, 5), Some(30.0));
+        // period larger than len → None.
+        assert_eq!(simple_moving_average(&closes, 6), None);
+        // period zero → None.
+        assert_eq!(simple_moving_average(&closes, 0), None);
     }
 
     #[test]
