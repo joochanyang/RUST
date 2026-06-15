@@ -64,6 +64,31 @@ docker exec trading-capture-postgres psql -U trading -d trading_system -c \
 df -h / && docker system df -v | grep capture-pgdata
 ```
 
+## Unattended watchdog (`watchdog.sh`)
+
+For a weeks-long unattended run, `deploy/watchdog.sh` is the safety net the
+in-process recovery can't provide. Compose `restart: unless-stopped` recovers a
+crash and the staleness reconnect recovers a stalled socket, but neither covers
+a container stuck non-crashed, a stopped postgres, or disk filling. Every 5 min
+the watchdog: brings containers back up if down, restarts capture if
+`order_books` freshness exceeds `STALL_SECS` (180s; healthy is <1s), and warns
+(log only — never auto-deletes) if the root fs exceeds `DISK_WARN_PCT` (85%).
+
+Install on the host (script lives in the repo; copy to `/opt` to match the
+server's cron convention):
+
+```sh
+install -D -m755 deploy/watchdog.sh /opt/trading-capture/watchdog.sh
+( crontab -l 2>/dev/null; \
+  echo '*/5 * * * * /opt/trading-capture/watchdog.sh >> /var/log/trading-capture-watchdog.log 2>&1' \
+) | crontab -
+# verify: a healthy run logs one "OK capture healthy ..." line
+/opt/trading-capture/watchdog.sh
+tail -f /var/log/trading-capture-watchdog.log
+```
+
+It assumes the repo at `/root/RUST/trading-system` (override `PROJECT_DIR`).
+
 ## When enough data has accumulated (weeks later)
 
 Pre-register the imbalance analysis FIRST (does `bid_size/(bid_size+ask_size)`
