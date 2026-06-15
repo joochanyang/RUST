@@ -21,7 +21,7 @@ use trading_strategy::{Strategy, TechnicalStrategy};
 use crate::{
     dashboard_api::SharedRuntimeControl,
     execution_repository::{
-        load_account_risk_state, load_open_position_keys,
+        close_orphaned_positions_for_key, load_account_risk_state, load_open_position_keys,
         load_open_protected_orders_by_mode_and_position, mark_position_closed_without_exit,
         persist_protected_order, update_open_position_marks,
     },
@@ -153,6 +153,52 @@ pub async fn run_binance_testnet_strategy_loop(
             HashSet::new()
         }
     };
+
+    // Position sweep: reconcile DB-restored keys against the exchange's actual open
+    // positions. An SL/TP can trigger while the bot is offline (restart, OS sleep,
+    // a frozen WS), closing the position on the exchange without the bot ever seeing
+    // the fill. Without this, the DB keeps a stale open position forever and blocks
+    // re-entry on a key that is already flat. Best-effort: a snapshot failure leaves
+    // the keys as-is (the conservative side — never wrongly drop a real position).
+    if !open_position_keys.is_empty() {
+        match adapter.fetch_account_snapshot().await {
+            Ok(snapshot) => {
+                let exchange_open = exchange_open_position_keys(ExchangeId::Binance, &snapshot.raw);
+                let orphans = orphaned_position_keys(&open_position_keys, &exchange_open);
+                for key in orphans {
+                    let Some((_, symbol_str)) = key.split_once(':') else {
+                        continue;
+                    };
+                    let symbol = trading_core::Symbol::new(symbol_str);
+                    match close_orphaned_positions_for_key(
+                        &pool,
+                        ExchangeId::Binance,
+                        &symbol,
+                        TradingMode::Testnet,
+                    )
+                    .await
+                    {
+                        Ok(closed) => {
+                            open_position_keys.remove(&key);
+                            notify(
+                                &notifications,
+                                format!(
+                                    "position sweep: {key} closed on exchange while offline; reconciled {closed} DB position(s) to closed"
+                                ),
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, %key, "position sweep failed to reconcile orphaned position");
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "position sweep skipped: account snapshot fetch failed");
+            }
+        }
+    }
 
     while let Some(observed) = receiver.recv().await {
         let MarketEvent::Candle(candle) = observed.event else {
@@ -1084,6 +1130,47 @@ impl CandleBuffers {
     }
 }
 
+/// Parses the set of position keys (`exchange:SYMBOL`) that the exchange reports
+/// as actually open (non-zero `positionAmt`) from a `/fapi/v3/account` snapshot.
+/// Binance only lists non-zero positions, but we filter defensively anyway.
+fn exchange_open_position_keys(
+    exchange: ExchangeId,
+    snapshot: &serde_json::Value,
+) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    let Some(positions) = snapshot.get("positions").and_then(|v| v.as_array()) else {
+        return keys;
+    };
+    for position in positions {
+        let amt = position
+            .get("positionAmt")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        if amt == 0.0 {
+            continue;
+        }
+        if let Some(symbol) = position.get("symbol").and_then(|v| v.as_str()) {
+            keys.insert(format!("{}:{}", exchange.as_str(), symbol));
+        }
+    }
+    keys
+}
+
+/// Returns the DB-restored position keys that the exchange does NOT report as
+/// open — these are orphans (e.g. closed by an SL/TP trigger while the bot was
+/// asleep or restarting) whose DB rows must be reconciled to closed.
+fn orphaned_position_keys(
+    db_keys: &HashSet<String>,
+    exchange_open: &HashSet<String>,
+) -> Vec<String> {
+    db_keys
+        .iter()
+        .filter(|key| !exchange_open.contains(*key))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1091,6 +1178,45 @@ mod tests {
     use std::sync::Mutex;
     use trading_core::{ExchangeId, Side, Symbol, TradingError};
     use trading_exchange::{AccountSnapshot, CancelAck, MarketStream, ProtectionAck};
+
+    // A /fapi/v3/account snapshot lists only non-zero positions, so a DB key whose
+    // symbol is absent (or zero) means the exchange has no such open position — an
+    // orphan left when an SL/TP triggered while the bot was asleep/restarting.
+    #[test]
+    fn orphaned_keys_are_db_keys_absent_from_exchange() {
+        let snapshot = serde_json::json!({
+            "positions": [
+                { "symbol": "BTCUSDT", "positionAmt": "-0.0020" },
+                { "symbol": "SOLUSDT", "positionAmt": "0" }
+            ]
+        });
+        let exchange_open = exchange_open_position_keys(ExchangeId::Binance, &snapshot);
+        // Only BTCUSDT is genuinely open (SOLUSDT is zero, so excluded).
+        assert!(exchange_open.contains("binance:BTCUSDT"));
+        assert!(!exchange_open.contains("binance:SOLUSDT"));
+
+        let db_keys: HashSet<String> = ["binance:ETHUSDT", "binance:BTCUSDT"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let orphans = orphaned_position_keys(&db_keys, &exchange_open);
+        // ETHUSDT was closed on the exchange (not in snapshot) -> orphan.
+        // BTCUSDT is still open on the exchange -> kept.
+        assert_eq!(orphans, vec!["binance:ETHUSDT".to_owned()]);
+    }
+
+    // A missing/empty positions array means the exchange has nothing open, so every
+    // DB key is an orphan (defensive: never silently keep a stale key).
+    #[test]
+    fn empty_snapshot_makes_all_db_keys_orphans() {
+        let snapshot = serde_json::json!({});
+        let exchange_open = exchange_open_position_keys(ExchangeId::Binance, &snapshot);
+        assert!(exchange_open.is_empty());
+
+        let db_keys: HashSet<String> = ["binance:ETHUSDT"].into_iter().map(String::from).collect();
+        let orphans = orphaned_position_keys(&db_keys, &exchange_open);
+        assert_eq!(orphans, vec!["binance:ETHUSDT".to_owned()]);
+    }
 
     // The outcome a test wants `query_order` to return, expressed as a plain
     // enum so each test can pick a reconcile branch without juggling raw JSON.

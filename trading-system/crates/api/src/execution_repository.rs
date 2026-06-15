@@ -397,6 +397,84 @@ pub async fn mark_position_closed_without_exit(
     Ok(true)
 }
 
+/// Reconciles the DB to the exchange: closes any still-open positions for the
+/// given `exchange`/`symbol`/`mode` whose entry order is of that mode. Used at
+/// startup when the exchange reports no open position for a key the DB still
+/// holds (an orphan left when an SL/TP triggered while the bot was offline).
+///
+/// Closes with `mark_price`/`unrealized_pnl` left as-is (the last mark) and sets
+/// the protection status to `reconciled_closed_offline`. Returns the number of
+/// positions closed. Guarded by `closed_at IS NULL` so it is idempotent.
+pub async fn close_orphaned_positions_for_key(
+    pool: &PgPool,
+    exchange: ExchangeId,
+    symbol: &Symbol,
+    mode: TradingMode,
+) -> Result<u64> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|error| TradingError::Database(error.to_string()))?;
+
+    let closed_at = Utc::now();
+
+    // Match open positions for this key whose entry order is of the given mode,
+    // via the same position->protection->order join used to restore keys. RETURNING
+    // the ids so the protection-order update targets exactly the rows we closed.
+    let closed_ids: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        UPDATE positions p
+        SET closed_at = $1
+        WHERE p.closed_at IS NULL
+          AND p.exchange = $2
+          AND p.symbol = $3
+          AND EXISTS (
+              SELECT 1
+              FROM protection_orders po
+              JOIN orders o ON o.id = po.entry_order_id
+              WHERE po.position_id = p.id
+                AND o.mode = $4
+          )
+        RETURNING p.id
+        "#,
+    )
+    .bind(closed_at)
+    .bind(exchange.as_str())
+    .bind(symbol.as_str())
+    .bind(mode.as_str())
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(|error| TradingError::Database(error.to_string()))?;
+
+    if closed_ids.is_empty() {
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| TradingError::Database(error.to_string()))?;
+        return Ok(0);
+    }
+
+    // Mark the matching protection orders so the reconciliation is auditable.
+    sqlx::query(
+        r#"
+        UPDATE protection_orders
+        SET status = 'reconciled_closed_offline'
+        WHERE position_id = ANY($1)
+        "#,
+    )
+    .bind(&closed_ids)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| TradingError::Database(error.to_string()))?;
+
+    transaction
+        .commit()
+        .await
+        .map_err(|error| TradingError::Database(error.to_string()))?;
+
+    Ok(closed_ids.len() as u64)
+}
+
 async fn insert_paper_exit(connection: &mut PgConnection, exit: &PaperExit) -> Result<()> {
     sqlx::query(
         r#"
@@ -800,6 +878,37 @@ mod tests {
         protected.position
     }
 
+    /// Seeds a fully linked order(mode)+fill+position+protection for a given mode,
+    /// via direct SQL (the paper broker refuses non-paper requests). Returns the
+    /// position id. Used to test cross-mode reconciliation.
+    async fn seed_open_position_sql(pool: &PgPool, symbol: &str, mode: TradingMode) -> Uuid {
+        // Real positions store the symbol uppercased (Symbol::new), so match that
+        // here — the sweep looks up by Symbol::new(...).as_str().
+        let symbol = Symbol::new(symbol);
+        let symbol = symbol.as_str();
+        let order_id = Uuid::new_v4();
+        let position_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO orders (id, exchange, mode, symbol, side, order_type, status, quantity, created_at)
+               VALUES ($1,'binance',$2,$3,'buy','market','filled',1, now())"#,
+        )
+        .bind(order_id).bind(mode.as_str()).bind(symbol)
+        .execute(pool).await.expect("insert order");
+        sqlx::query(
+            r#"INSERT INTO positions (id, exchange, symbol, side, entry_price, mark_price, quantity, leverage, unrealized_pnl, opened_at)
+               VALUES ($1,'binance',$2,'long',1000,1000,1,1,0, now())"#,
+        )
+        .bind(position_id).bind(symbol)
+        .execute(pool).await.expect("insert position");
+        sqlx::query(
+            r#"INSERT INTO protection_orders (id, entry_order_id, position_id, stop_loss_price, take_profit_price, status)
+               VALUES ($1,$2,$3,990,1010,'active')"#,
+        )
+        .bind(Uuid::new_v4()).bind(order_id).bind(position_id)
+        .execute(pool).await.expect("insert protection");
+        position_id
+    }
+
     fn unique_symbol(prefix: &str) -> String {
         format!("{prefix}{}", Uuid::new_v4().simple())
     }
@@ -1069,5 +1178,82 @@ mod tests {
             Decimal::new(-1_000, 0),
             "closed long 1.0 @50000 marked 49000 must count as realized loss"
         );
+    }
+
+    // Position sweep: an orphaned testnet position (still open in DB, closed on the
+    // exchange) must be reconciled to closed, idempotently, without touching other
+    // keys or other modes.
+    #[tokio::test]
+    async fn close_orphaned_positions_for_key_reconciles_testnet_orphan() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping DB integration test; TEST_DATABASE_URL is not set");
+            return;
+        };
+        let symbol = unique_symbol("SWEEP");
+        let pos_id = seed_open_position_sql(&pool, &symbol, TradingMode::Testnet).await;
+
+        // First sweep closes the orphan.
+        let closed = close_orphaned_positions_for_key(
+            &pool,
+            ExchangeId::Binance,
+            &Symbol::new(&symbol),
+            TradingMode::Testnet,
+        )
+        .await
+        .expect("sweep");
+        assert_eq!(closed, 1, "the orphaned testnet position must be closed");
+
+        let is_closed: bool =
+            sqlx::query("SELECT closed_at IS NOT NULL FROM positions WHERE id = $1")
+                .bind(pos_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load position")
+                .get(0);
+        assert!(is_closed, "position must be marked closed");
+
+        // Idempotent: a second sweep closes nothing.
+        let again = close_orphaned_positions_for_key(
+            &pool,
+            ExchangeId::Binance,
+            &Symbol::new(&symbol),
+            TradingMode::Testnet,
+        )
+        .await
+        .expect("second sweep");
+        assert_eq!(again, 0, "an already-closed position must not be re-closed");
+    }
+
+    // The sweep must not close a position of a different mode (a paper position is
+    // not an orphan of the testnet runtime).
+    #[tokio::test]
+    async fn close_orphaned_positions_for_key_ignores_other_mode() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping DB integration test; TEST_DATABASE_URL is not set");
+            return;
+        };
+        let symbol = unique_symbol("SWEEPMODE");
+        let pos_id = seed_open_position_sql(&pool, &symbol, TradingMode::Paper).await;
+
+        let closed = close_orphaned_positions_for_key(
+            &pool,
+            ExchangeId::Binance,
+            &Symbol::new(&symbol),
+            TradingMode::Testnet,
+        )
+        .await
+        .expect("sweep");
+        assert_eq!(
+            closed, 0,
+            "a paper position must not be swept as a testnet orphan"
+        );
+
+        let still_open: bool = sqlx::query("SELECT closed_at IS NULL FROM positions WHERE id = $1")
+            .bind(pos_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load position")
+            .get(0);
+        assert!(still_open, "the paper position must remain open");
     }
 }
