@@ -14,7 +14,9 @@
 ## 📡 진행 중 — 오더북-임밸런스 가설용 장기 캐처 (2026-06-16~) **★Hetzner 라이브 배포 완료**
 **재개 트리거: "rust 트레이딩 이어서 작업" → 이 섹션이 활성 작업**
 
-> **🟢 라이브 상태(2026-06-16 배포)**: Hetzner(`5.161.112.248`)에 **무거래 캐처 가동 중**. 컨테이너 `trading-capture`+`trading-capture-postgres`(전용 DB) RestartCount=0·healthy. 6피드(binance/bybit/bitget×BTC/ETH) **~1.0 row/sec**(1초 샘플 정확 작동), row 신선도 <0.5s. `paper_trading=false`·주문 0(캐처-only 확인). Bitget WS 리셋→자동재연결 1회 관측(정상). 배포: deploy key(read-only, id 154537679)로 git clone→`docker compose --env-file .env -f deploy/docker-compose.capture.yml up -d --build`. **모니터/재시작 = `deploy/README.md`**. **다음 = 몇 주 데이터 쌓일 때까지 방치 + 가끔 insert율/디스크 점검**(아래 4번).
+> **🟢 라이브 상태(2026-06-16 배포)**: Hetzner(`5.161.112.248`)에 **무거래 캐처 가동 중**. 컨테이너 `trading-capture`+`trading-capture-postgres`(전용 DB) RestartCount=0·healthy. 6피드(binance/bybit/bitget×BTC/ETH) **~1.0 row/sec**(1초 샘플 정확 작동), row 신선도 <0.5s. `paper_trading=false`·주문 0(캐처-only 확인). Bitget WS 리셋→자동재연결 1회 관측(정상). 배포: deploy key(read-only, id 154537679)로 git clone→`docker compose --env-file .env -f deploy/docker-compose.capture.yml up -d --build`.
+> **🛡 watchdog 상주(2026-06-16, `973d370`)**: `/opt/trading-capture/watchdog.sh` + cron `*/5`. 컨테이너 down→`up -d`, `order_books` freshness>180s(stall)→capture restart, 디스크>85%→경보(로그만). 로그 `/var/log/trading-capture-watchdog.log`. **검증**: 헬시=무동작 OK 1줄 / `docker stop` 강제→감지·자동복구·row 재개 실측. compose `restart:unless-stopped`+staleness 자가복구가 못 잡는 케이스(non-crash·PG정지·디스크)를 메움. 스크립트는 repo `deploy/watchdog.sh`에 버전관리.
+> **모니터/재시작 = `deploy/README.md`**. **다음 = 몇 주 데이터 쌓일 때까지 방치(watchdog가 지킴) → 충분해지면 imbalance 사전등록 분석**(아래 4번).
 
 > **방향(사용자 선택 2026-06-16)**: 멈춤 직후, 가격방향과 **직교한** 후속으로 **오더북 top-of-book 불균형(imbalance) 가설**을 노리기로 함. 단 검증하려면 데이터가 필요한데 DB 실측 결과:
 > - `funding_rates` 테이블 없음 → 펀딩비/캐리 가설은 데이터 적재부터(보류).
