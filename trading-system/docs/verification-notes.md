@@ -223,3 +223,35 @@ Operational readiness still requires real-world evidence collection before any l
 
 - Run at least 2 weeks of paper trading and record evidence.
 - Verify live exchange API keys are restricted to the minimum required permissions and record `api_key_restricted` evidence.
+
+---
+
+## 2026-06-15 — Trend-filtered breakout: walk-forward OOS falsification (FAILED, as expected)
+
+Hypothesis: adding an SMA trend gate to the rolling volatility breakout (Buy only
+when close > SMA, Sell only when close < SMA) removes whipsaw and creates an OOS edge.
+
+Validation: `walk_forward_trend_filter` (`backtest_runner.rs`, `#[ignore]`), 12-combo
+grid (lookback {10,20} × k {0.3,0.5,0.7} × ma_period {30,50}, ma_period > lookback),
+4 rolling windows (IS 4mo → OOS 2mo), BTC+ETH binance 1m, fee-aware
+(taker 0.04% + slippage 0.01% per side), cost sensitivity 1×/2×/3×. ~424s.
+
+OOS results (1× cost):
+- W1 (IS 2024-06..10 → OOS 2024-10..12): IS-best lb10/k0.5/ma30 → OOS −312.24
+- W2 (IS 2025-01..05 → OOS 2025-05..07): IS-best lb20/k0.7/ma50 → OOS +80.81 (2×: −38.45, 3×: −156.31)
+- W3 (IS 2025-08..12 → OOS 2025-12..2026-02): IS-best lb10/k0.5/ma50 → OOS −218.07
+- W4 (IS 2026-01..05 → OOS 2026-05..06-15): IS-best lb20/k0.7/ma50 → OOS −97.47
+
+OOS mean −136.74, median −157.77, worst −312.24, positive 1/4.
+
+Verdict: FAIL the pre-registered pass gate (requires all-4 positive, mean > 2× cost,
+survives 2× cost). The one positive window flips negative at 2× cost. IS-best params
+change every window = noise, not a stable edge. IS grids mostly deeply negative.
+
+Conclusion (pre-registered STOP): the rolling-breakout family (pure + trend-filtered)
+has NO edge on this data/buffer. Live runtime NOT swapped (stays on
+VolatilityBreakoutStrategy). Grid NOT widened. Next: a structurally different bet
+(different timeframe / mean-reversion / engine-buffer expansion), not a 4th knob.
+
+The pre-implementation adversarial design review predicted "honest expected OOS ~0%";
+the measured result is cleanly negative, removing any ambiguity.
