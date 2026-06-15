@@ -1,6 +1,6 @@
 # PROGRESS — trading-system (Rust 코인선물 AI 트레이딩)
 
-> 마지막 갱신: 2026-06-15 (★보호주문 e2e 라이브 검증 종결 + WS silent-stall 재연결 수정). 다음 세션에서 이 파일부터 읽고 "재개 지점"으로 이동.
+> 마지막 갱신: 2026-06-15 (보호주문 e2e 라이브 종결 + WS재연결 + position sweep. **다음=새 전략 만들기**). 다음 세션에서 이 파일부터 읽고 "다음 세션 첫 액션"으로 이동.
 
 ## 현재 상태 (한 줄)
 머니6종 + 후속 + reconcile + **latency-gate + Bitget 8h + 보호주문 Algo API(+e2e 라이브 종결) + 출시 전 감사 P0/P1 + runbook 정합성 + WS silent-stall 재연결 완료**.
@@ -52,12 +52,46 @@
 - **검증(TDD RED→GREEN + 적대적 리뷰 2회)**: 설계 워크플로(7에이전트: 3제안→3공격→종합, Proposal 3 채택=치명결함 0)→구현→커밋 전 적대적 리뷰(4에이전트, **ship-as-is·must-fix 0**, 유일 지적=Bitget 비-1m 대문자형 잠재갭 LOW→선반영). **85 통과/0 실패, fmt clean, clippy 13(신규 0)**. 기존 테스트 1개(`market_latency_details_include_gate_context`) 의도적 수정(기준이 open→close로 이동해 received_at +60s)
 - **함정 기록**: ⚠️**latency≠open_time 기준**(캔들은 close_time 기준이어야 정상틱이 fresh). 1m 캔들 경계틱도 open_time 기준이면 7-10초. 적대적 리뷰가 머니게이트에서 결정적(초기 진단 반증). DB 증거 우선(risk_events/candles/order_books). **타임아웃 트레이드오프**: 캔들 staleness 탐지창이 ~2s→~interval+2s(1m=62s)로 넓어짐(의도된 것, 실제 freeze 탐지는 오더북 경로+새 캔들 부재로)
 
-## 🚀 다음 세션 첫 액션 (clear 후 여기부터)
-1. 위 "부팅 명령어" 복붙 → **96 passed / 0 failed · fmt clean · clippy warning 1** 확인(그린 베이스라인)
-2. **세 버그 모두 해결·검증됨**(latency-gate / Bitget 8h / 보호주문 Algo). git `main` = `f936ab9` 동기화 완료.
-3. **⚙️ testnet 봇은 직전 세션 종료 시 kill 완료**(실행 중 아님). 다시 띄우려면 "재개 지점" 위의 봇 실행 명령 또는 `set -a; source .env; set +a && RUST_LOG=trading_api=debug,info cargo run -p trading-api --bin trading-api`. 검증 로그는 `/tmp/trading-bot-run3.log`(latency 0~128ms 확인 가능, 참고용).
-4. **다음 할 일(선택)**: 아래 "재개 지점"의 ①보호주문 e2e 라이브(진입→보호 전체경로, 시장 과매도 시 자연발생) ②position sweep ③signal.id 안정화 ④timeframe CI 가드. **급한 버그 없음** — 추가 작업 안 하면 현 상태로 종결 가능.
-5. 트리거 문구: "rust 트레이딩 이어서 작업"
+## 🚀 다음 세션 첫 액션 — ★새 전략 만들기 (clear 후 여기부터)
+**트리거 문구: "rust 트레이딩 새 전략 만들자"** (또는 "rust 트레이딩 이어서 작업")
+
+### 0. 그린 베이스라인 확인 (먼저)
+- `set -a; source .env; set +a; export TEST_DATABASE_URL=$(echo "$DATABASE_URL" | sed 's#/trading_system$#/trading_system_test#')`
+- `cargo test --workspace` → **103 passed / 0 failed**(병렬 OK, flaky 해소됨), `cargo fmt --all -- --check`=clean, clippy warning 1(기존 `ai_repository.rs:83` 인자수)
+- git `main` = `df37ec7` 동기화 완료. ⚠️git 루트=부모 `~/Documents/Rust`. ⚠️.env 커밋 금지. DB테스트는 `TEST_DATABASE_URL` 필요(로컬 `trading_system_test`).
+- 봇은 직전 세션에 kill됨(실행 중 아님). 미결 testnet 포지션 0(sweep로 정리됨).
+
+### 1. 전략 시스템 구조 (★새 전략은 여기만 건드림 — 엔진 불변)
+- **전부 `crates/strategy/src/lib.rs` 한 파일** (~6KB). 핵심은 trait 1개:
+  ```rust
+  pub trait Strategy: Send + Sync {
+      fn name(&self) -> &'static str;
+      fn evaluate(&self, candles: &[Candle]) -> Vec<Signal>;  // 입력=캔들, 출력=시그널(매수/매도/없음)
+  }
+  ```
+- **현재 전략 = `TechnicalStrategy`** (RSI+볼린저 듀얼컨펌): 매수=`RSI≤30 && 종가≤볼린저하단`, 매도=`RSI≥70 && 종가≥볼린저상단`. 파라미터(rsi_period14·bollinger20·임계30/70)는 `Default`에 하드코딩. `score`=임계값 이탈폭(신호강도). AI 필터는 OFF(`ai_filter:false`, 순수 룰).
+- 헬퍼 이미 있음: `calculate_rsi`, `calculate_bollinger_bands`, `closes_as_f64`, `build_signal`, `score_from_distance`.
+- **시그널→주문 흐름**: `evaluate()`→리스크게이트(latency/일일손실/lock)→testnet 시장주문 체결→SL/TP 보호주문(Algo API). **전략은 방향만 결정, 주문/보호/리스크는 엔진이 처리**(돈 실수 여지 없음).
+
+### 2. 새 전략 만드는 절차 (TDD)
+1. `lib.rs`에 새 struct(예: `MaCrossStrategy`) + `impl Strategy` 작성. 지표계산→조건→`build_signal`.
+2. 단위 테스트 먼저(RED): 알려진 캔들 시퀀스 → 기대 시그널. lib.rs 하단 `#[cfg(test)]`에 기존 RSI 테스트 패턴 참고.
+3. 런타임에서 `TechnicalStrategy::default()` 쓰는 곳을 새 전략으로 교체 (testnet=`testnet_runtime.rs:71`, 백테스트/paper 경로도 확인).
+4. **백테스트 검증**: 과거 캔들 import(`import_historical_candles` bin) → `POST /api/backtest-runs/run` → `max_drawdown_pct`/trade수 확인. (runbook.md "Backtesting" 섹션 참고)
+5. testnet 라이브 검증(원하면). 봇 실행: `set -a; source .env; set +a && RUST_LOG=trading_api=debug,info cargo run -p trading-api --bin trading-api`
+
+### 3. 전략 고도화 시 마주칠 구조적 한계 (미리 알아둘 것)
+- `evaluate()`가 **캔들만** 받음 → 오더북/펀딩비/외부데이터 쓰려면 trait 인터페이스 확장 필요
+- **최신 캔들만 보고 판단** → 포지션 보유상태/진입가 모름(엔진의 SL/TP가 청산 담당). "보유 중 트레일링" 같은 건 현 구조론 전략이 못 함
+- 파라미터 하드코딩 → 튜닝하려면 설정화(env/config) 필요
+- 단일 심볼 독립 평가 → 페어트레이딩 등 멀티심볼은 구조 확장 필요
+
+### 4. 사용자 결정사항 (이번 세션 합의)
+- **AI 없이 룰 기반으로 운영** (비용0·재현성·백테스트 신뢰도). AI 필터는 나중에 선택적으로.
+- 직접 전략 설계·백테스트·튜닝 하기로 함.
+
+### 참고: 남은 후속(전략과 별개, 선택) — 아래 "재개 지점" 참조
+주기적 position sweep(현재 기동 시 1회만), signal.id 안정화, timeframe CI 가드. **급한 버그 없음.**
 
 ## ✅ 운영 확인 완료 (2026-06-14, 사용자 키로 검증)
 - **`demo-fapi.binance.com` = 진짜 testnet 확정**: 사용자 testnet 키로 signed `GET /fapi/v3/account` → HTTP 200 + **testnet 가짜잔고**(USDT 5282·USDC 5000·BTC 0.01). 같은 키를 실거래 `fapi.binance.com`에 치면 **HTTP 401 `-2015`**(거부) → testnet 전용 확정, 실거래 자금 위험 없음
