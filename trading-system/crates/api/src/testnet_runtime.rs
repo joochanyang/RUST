@@ -16,7 +16,7 @@ use trading_exchange::{
     binance::BinanceAdapter, ExchangeAdapter, MarketOrderRequest, OrderAck, ProtectionOrderRequest,
 };
 use trading_risk::{BasicRiskGate, RiskGate};
-use trading_strategy::{Strategy, TechnicalStrategy};
+use trading_strategy::{Strategy, VolatilityBreakoutStrategy};
 
 use crate::{
     dashboard_api::SharedRuntimeControl,
@@ -68,7 +68,7 @@ pub async fn run_binance_testnet_strategy_loop(
         .await;
     }
 
-    let strategy = TechnicalStrategy::default();
+    let strategy = VolatilityBreakoutStrategy::default();
     let risk_gate = BasicRiskGate::default();
     let ai_gate = AiEntryGate::new(AiGateConfig {
         enabled: config.ai_filter_enabled,

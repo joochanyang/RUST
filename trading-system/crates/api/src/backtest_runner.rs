@@ -5,7 +5,7 @@ use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use trading_core::{Candle, ExchangeId, PositionSide, Result, Signal, Symbol, TradingError};
 use trading_risk::{AccountRiskState, BasicRiskGate, RiskGate};
-use trading_strategy::{Strategy, TechnicalStrategy};
+use trading_strategy::{Strategy, VolatilityBreakoutStrategy};
 
 const BACKTEST_HISTORY_LIMIT: usize = 64;
 
@@ -120,7 +120,7 @@ pub async fn run_backtest(pool: &PgPool, config: BacktestConfig) -> Result<Backt
         ));
     }
 
-    let strategy = TechnicalStrategy::default();
+    let strategy = VolatilityBreakoutStrategy::default();
     let risk_gate = BasicRiskGate::default();
     let mut equity = initial_equity;
     let mut peak_equity = initial_equity;
@@ -344,7 +344,7 @@ pub fn metrics_to_json(metrics: &BacktestMetrics) -> serde_json::Value {
 }
 
 pub fn strategy_version() -> &'static str {
-    "technical_rsi_bollinger_v1"
+    "volatility_breakout_v1"
 }
 
 #[cfg(test)]

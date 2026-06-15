@@ -9,7 +9,7 @@ use trading_ai::{
 use trading_core::{Candle, MarketEvent, ObservedMarketEvent};
 use trading_execution::{PaperBroker, PaperPositionTracker};
 use trading_risk::BasicRiskGate;
-use trading_strategy::{Strategy, TechnicalStrategy};
+use trading_strategy::{Strategy, VolatilityBreakoutStrategy};
 
 use crate::{
     ai_repository::persist_ai_context,
@@ -62,7 +62,7 @@ pub async fn run_paper_strategy_loop(
     notifications: Option<NotificationSender>,
     config: PaperStrategyRuntimeConfig,
 ) {
-    let strategy = TechnicalStrategy::default();
+    let strategy = VolatilityBreakoutStrategy::default();
     let risk_gate = BasicRiskGate::default();
     let broker = PaperBroker::default();
     let ai_gate = AiEntryGate::new(AiGateConfig {
