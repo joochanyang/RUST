@@ -1,35 +1,42 @@
 # PROGRESS — trading-system (Rust 코인선물 AI 트레이딩)
 
-> 마지막 갱신: 2026-06-15 (★**평균회귀(RSI+볼린저) 워크포워드 검증 완료 → OOS 평균 −185.40, positive 0/4, expectancy 0/4, 거래수 충분(337~596) → 3번째 전략 패밀리도 엣지 없음 확정. 라이브 교체 안 함. 커밋·푸시 완료 `91ac208`**). 다음 세션 이 파일부터 읽고 아래 "🚀 다음 세션 첫 액션". ★★다음 목표=**다른 타임프레임(5m/1h)으로 전략 재검증** — ✅5m/1h 캔들 DB 적재 완료(2026-06-15) → 하니스 `timeframe` 바꿔 검증, 어떤 전략 돌릴지 브레인스토밍부터.
+> 마지막 갱신: 2026-06-15 (★**평균회귀(RSI+볼린저) 워크포워드 검증 완료 → OOS 평균 −185.40, positive 0/4, expectancy 0/4, 거래수 충분(337~596) → 3번째 전략 패밀리도 엣지 없음 확정. 라이브 교체 안 함. 커밋·푸시 완료 `91ac208`**). 다음 세션 이 파일부터 읽고 아래 "🚀 다음 세션 첫 액션". ★★현재=**5m돌파 FAIL·1h돌파 INCONCLUSIVE**(1h 가장 유망하나 거래수 부족). 다음 목표=**1h INCONCLUSIVE 해소(심볼/윈도우 늘리기, 진입튜닝 금지) 또는 엔진버퍼 확장(일봉)** — 사용자 결정 대기. 🔴 타임프레임 돌파 하니스 미커밋.
 
 ## 🚀 다음 세션 첫 액션 — ★구조적으로 다른 전략 베팅 (clear 후 여기부터)
 **트리거 문구: "rust 트레이딩 이어서 작업" 또는 "실거래 전략 만들기 이어서"**
 
 > **목표(사용자)**: "실거래 할 수 있는 전략". 검증 가능 목표=**OOS에서 수수료 반영 후 일관 양(+)**.
-> **현재 결론**: **3개 전략 패밀리(순수돌파·추세필터돌파·평균회귀) 전부** 이 데이터(binance 1m, 100캔들 버퍼, BTC+ETH, 2024~2026)에서 OOS 엣지 없음 실증. **같은 데이터·같은 1분봉 위에서 더 튜닝·더 노브 금지**(사전등록 STOP). 진짜 다른 방향=**다른 타임프레임 / 엔진버퍼 확장(정통 일봉) / 다른 데이터(오더북·펀딩비)**. 셋 다 보장 없음, 매번 OOS+수수료로 판정. **family-wise 주의**(같은 데이터 4번째 시도 = 거짓양성 누적).
+> **현재 결론**: 1m 3패밀리(순수돌파·추세필터돌파·평균회귀) 전부 OOS 엣지 없음. **타임프레임 확장(5m/1h) 검증함**(2026-06-15): **5m 돌파=FAIL**(평균 −92.84·1/4+, 단 1m보다 손실↓·W4 첫 양전=수수료드래그 가설 방향성 맞음), **1h 돌파=INCONCLUSIVE**(평균 −26.08·2/4+·2/4 expectancy+ 이지만 W2 16거래<floor20 → 엣지 없음으로 단정 못 함). **방향성은 좋아지나(타임프레임↑→손실↓) 아직 엣지 증명 못 함.** 다음 후보=①1h 거래수 늘려 INCONCLUSIVE 해소(심볼 추가/floor 재고/윈도우 확대) ②엔진버퍼 확장(정통 일봉) ③다른 데이터. **family-wise 주의**(시도 누적=거짓양성).
 
 ### ⚠️ 먼저 읽을 것 — 과최적화 함정 (★세 번 실증됨, 재발 절대 금지)
 1. **순수 변동성돌파**(lookback/k): 워크포워드 OOS 평균 **+0.00%**(수수료 전). IS-최적이 OOS서 무너짐.
 2. **추세필터 변동성돌파**(lookback/k/ma_period, +수수료): 워크포워드 OOS **평균 −136.74·1/4 윈도우만 +**, 그 1개도 2×비용서 음전. IS-best 파라미터 윈도우마다 바뀜=노이즈.
 3. **평균회귀(RSI+볼린저)**(2026-06-15, `TechnicalStrategy`, 평균회귀-적합 출구로 검증): OOS **평균 −185.40·positive 0/4·expectancy 0/4·거래수 337~596(충분)**. IS 27조합 전부 음수(−298~−4,964), 음수가 거래수에 비례(rsi7→1.5만거래→−4,964)=**스냅백이 taker수수료+슬리피지 못 이김**. ⭐**핵심 교훈: 검증 전 적대적 설계리뷰 필수** — 원래 계획은 돌파용 2:1 브래킷 출구를 평균회귀에 그대로 씌워 "잘못된 출구로 테스트"할 뻔했음(3에이전트 만장일치 CRITICAL). 출구를 중간밴드복귀/RSI50/하드스톱/시간스톱으로 고쳐서야 정직한 FAIL 판정 가능.
-- **교훈**: "백테스트 수익 좋아질 때까지 파라미터 돌리기"=과최적화 정의 그대로. **IS 숫자 믿지 말 것. OOS+수수료로만 판정.** **출구가 전략 논리와 맞는지 먼저 확인**(진입만 보면 안 됨). 새 전략도 반드시 같은 워크포워드+OOS+수수료+적대적리뷰로 검증.
+4. **추세필터 돌파 5m/1h 재검증**(2026-06-15, 1m→롤업 캔들, 코드 변경 0·하니스 `timeframe`만 바꿈): **5m=FAIL**(OOS 평균 −92.84·positive 1/4·거래수 60~419 충분, W4 +6.75 첫 양전), **1h=INCONCLUSIVE**(OOS 평균 −26.08·positive 2/4·expectancy 2/4+, **그러나 W2가 16거래<floor20** → 사전등록 규율상 falsification 아님). ⭐**핵심 교훈: 거래수 진단이 가짜 희망 차단** — 1h는 손실 가장 작고 2/4 양전이라 PnL만 보면 "엣지 있을지도"로 보이지만 W2 16거래는 무의미. 진단 없었으면 오판. **방향성=타임프레임↑→손실↓→수수료드래그 가설 지지**, 단 엣지엔 미달.
+- **교훈**: "백테스트 수익 좋아질 때까지 파라미터 돌리기"=과최적화 정의 그대로. **IS 숫자 믿지 말 것. OOS+수수료로만 판정.** **출구가 전략 논리와 맞는지 먼저 확인**(진입만 보면 안 됨). **거래수 floor로 INCONCLUSIVE/FAIL 구분**(저빈도 타임프레임은 가짜 0 위험). 새 전략도 반드시 같은 워크포워드+OOS+수수료+적대적리뷰로 검증.
 
 ### ✅ 이번 세션 산출물 (평균회귀 검증 — 커밋·푸시 완료 `91ac208`)
 - **`TechnicalStrategy` 파라미터화**(`crates/strategy/src/lib.rs`): `new(rsi_period, bollinger_period, oversold, overbought)`+getter 추가. `Default` 불변. 라이브 미사용(라이브=`VolatilityBreakoutStrategy::default()` 유지). TDD 2테스트(비기본 임계값이 신호를 실제로 바꿈 검증).
 - **평균회귀 전용 백테스트 코어**(`backtest_runner.rs` 테스트모듈): `run_mean_reversion_backtest(pool,config,&TechnicalStrategy)` — 진입은 BasicRiskGate로 사이징하되 **출구는 평균회귀-적합**(하드스톱1%→중간밴드복귀(SMA)→RSI50재크로스→시간스톱60봉, 우선순위순). 프로덕션 `run_backtest`·`BacktestConfig`·HTTP API **전부 불변**(strategy 디스크리미네이터 추가 안 함 — strategy_version 오라벨·dyn디스패치·config비대화 회피). MR 출구 4단위테스트.
 - **평균회귀 워크포워드 하니스**(`#[ignore]` 영구): 27조합×4윈도우, IS최소거래(≥20)충족 조합 중 IS-best 선택, OOS 1×/2×/3×, 윈도우별 trades/wins/losses/per-trade expectancy/IS-best PnL+OOS 진단, **3진 판정(PASS/FAIL/INCONCLUSIVE)**. 실행: `cargo test -p trading-api --bin trading-api backtest_runner::tests::walk_forward_mean_reversion -- --ignored --nocapture`(DATABASE_URL 필요, ~815s).
 - spec: `docs/superpowers/specs/2026-06-15-mean-reversion-validation-design.md`(적대적 리뷰 반영판 + 실행결과 §8.1). **적대적 설계리뷰가 치명결함(추세용 출구) 잡아냄 — 이게 정직한 판정의 핵심.**
-- 테스트 **126 passed / 0 failed / 2 ignored**(이전 120/0/1 + MR 6테스트 + MR 하니스 1 ignored). fmt clean, clippy 신규0(기존 ai_repository 인자수 1만 잔존).
+- 테스트 **126 passed / 0 failed / 2 ignored**. fmt clean, clippy 신규0(기존 ai_repository 인자수 1만 잔존).
 
-### ⏭ 다음 세션 — ★다른 타임프레임(5m/1h)으로 전략 재검증 (사용자 선택, 데이터 준비됨)
-**1m 데이터 무엣지(3패밀리) → 사용자 선택=다른 타임프레임. ✅ 5m/1h 캔들 DB 적재 완료(2026-06-15).**
+### ✅ 이번 세션 추가 산출물 (5m/1h 타임프레임 확장 — 커밋 `77a6ef0` + 미커밋 하니스)
+- **5m/1h 캔들 DB 적재**(커밋 `77a6ef0`, 순수 데이터): binance BTC/ETH 1m→5m/1h 롤업, 같은 `candles` 테이블 `timeframe='5m'/'1h'`. **완전한 버킷만**(`HAVING count=5/60`), idempotent. 각 심볼 **5m≈315.7k·1h=26,310행**(2023-06~2026-06 풀커버), OHLCV 무결성 검증통과. **롤업 SQL**(재실행/심볼확장 그대로): `to_timestamp(floor(extract(epoch from open_time)/N)*N)` 버킷(5m=300·1h=3600), open=`array_agg ORDER BY open_time ASC[1]`·close=`DESC[1]`·high=max·low=min·vol=sum.
+- **타임프레임 파라미터 돌파 하니스**(`backtest_runner.rs` 테스트모듈, `#[ignore]`, 🔴**아직 커밋 안 함**): `walk_forward_breakout_higher_timeframes`(5m+1h 순차) + `walk_forward_breakout_for_timeframe`/`run_combo_tf`. 기존 `walk_forward_trend_filter`(1m) **불변**(복제 안 함). 거래수 진단 + 3진판정. 실행 ~93s. 테스트 **126 passed/0 failed/3 ignored**(새 하니스가 ignored 추가), fmt/clippy clean.
+- **결과**(위 함정#4): 5m=FAIL(평균 −92.84·1/4+), 1h=INCONCLUSIVE(평균 −26.08·2/4+, W2 16거래<floor). 타임프레임↑→손실↓ 방향성 확인, 엣지엔 미달.
 
-✅ **롤업 완료 (순수 데이터 작업, 코드 변경 0, 커밋 불필요)**: binance BTC/ETH 1m을 5m/1h로 집계해 같은 `candles` 테이블에 `timeframe='5m'`/`'1h'`로 INSERT. **완전한 버킷만**(5m=정확히 5개·1h=정확히 60개 1m, `HAVING count=N`), idempotent(`ON CONFLICT DO NOTHING`). 적재량: BTC/ETH 각 **5m≈315.7k·1h=26,310행**(2023-06-13~2026-06-15 풀커버). 무결성 검증 통과(임의버킷 OHLCV가 1m 직접집계와 완전일치, 갭은 1m 원본 갭만 반영=2026-06-13~14 ~32.5h 수집중단분).
-- **롤업 SQL**(재실행/다른 심볼 확장 시 그대로): `to_timestamp(floor(extract(epoch from open_time)/N)*N)` 버킷(5m=300·1h=3600), `open=array_agg(open ORDER BY open_time ASC)[1]`·`close=...DESC[1]`·`high=max`·`low=min`·`volume=sum`, `GROUP BY symbol, floor(epoch/N) HAVING count(*)=N/60`.
+### ⏭ 다음 세션 — ★1h INCONCLUSIVE 해소 또는 다른 데이터 (사용자 결정 대기)
+**5m=FAIL·1h=INCONCLUSIVE. 1h가 가장 유망(손실 최소·2/4+)하나 거래수 부족(W2 16<20)으로 판정 불가.**
 
-**다음 첫 액션**: 백테스트는 `load_candles`가 `timeframe` 필터를 이미 쓰므로 **하니스에서 `timeframe: Some("5m")` 또는 `"1h"`만 바꾸면** 5m/1h로 검증됨(Rust 코드 변경 0). ⚠️**`BACKTEST_HISTORY_LIMIT=64`라 lookback/period≤~63 캔들** — 5m×64=5.3h·1h×64=2.7일 윈도우. 어떤 전략을 5m/1h로 돌릴지(돌파 재검증? 평균회귀 재검증? 새 가설?) **브레인스토밍부터**. 같은 OOS+수수료+적대적리뷰+3진판정 규율 유지.
+다음 첫 액션 후보(브레인스토밍/사용자 결정):
+1. **1h 거래수 늘려 INCONCLUSIVE 해소** — 심볼 추가(SOL/BNB 등, 단 1m 적재·롤업 먼저)·OOS 윈도우 확대(2mo→3~4mo)·또는 floor 재고. ⚠️ 진입조건 튜닝은 금지(과최적화). 거래수만 늘려 같은 전략을 재판정.
+2. **엔진 버퍼 확장**(`PAPER_MAX_CANDLES_PER_KEY`↑ + 시작 DB백필) → 정통 일봉. 엔진 수정=범위 커짐.
+3. **다른 데이터**(오더북 불균형/펀딩비) — trait 확장 필요.
+- ⚠️**`BACKTEST_HISTORY_LIMIT=64`** → 5m/1h도 lookback≤~63캔들(1h×64=2.7일). 일봉 가려면 버퍼 확장 필수.
 
-남은 다른 방향(타임프레임이 또 무엣지면):
+남은 다른 방향(전부 무엣지면):
 - **엔진 버퍼 확장**(`PAPER_MAX_CANDLES_PER_KEY`↑ + 시작 DB백필) → 정통 일봉. 엔진 수정=범위 커짐.
 - **다른 데이터**(오더북 불균형/펀딩비) — trait 확장 필요(`evaluate`가 캔들만 받음).
 - ⚠️ 보장 없음. **family-wise 과최적화 주의**(같은 데이터 N번째 시도=거짓양성 누적). 5m/1h는 1m과 다른 데이터라 family-wise 리셋에 가깝지만, 같은 BTC/ETH·같은 거시국면이므로 마진 PASS면 새 홀드아웃 필수.

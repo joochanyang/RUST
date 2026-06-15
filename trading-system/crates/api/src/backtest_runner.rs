@@ -1341,4 +1341,212 @@ mod tests {
         };
         eprintln!("\n=== VERDICT ===\n  {verdict}");
     }
+
+    // ----- Trend-filtered breakout on higher timeframes (5m / 1h) ------------
+    //
+    // The 1m families (pure breakout, trend-filtered breakout, mean reversion)
+    // all died with no OOS edge, the mean-reversion run showing loss scaling with
+    // trade count = fee drag. Higher timeframes trade far less often, directly
+    // cutting that drag — so this re-runs the EXISTING trend-filtered breakout
+    // grid on 5m and 1h candles (rolled up from 1m, materialized in the DB).
+    //
+    // Same pre-registered grid (walk_forward_grid), windows, IS-best selector,
+    // cost sensitivity, and three-way verdict as the MR harness. Higher timeframes
+    // mean fewer trades, so the MR_MIN_TRADES floor matters MORE here: a window
+    // below it is INCONCLUSIVE (no-data), never "no edge". Do NOT widen the grid.
+    //
+    // Run: `cargo test -p trading-api --bin trading-api \
+    //        backtest_runner::tests::walk_forward_breakout_higher_timeframes -- --ignored --nocapture`
+
+    async fn run_combo_tf(
+        pool: &PgPool,
+        timeframe: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        combo: Combo,
+        cost_multiplier: f64,
+    ) -> BacktestMetrics {
+        let config = BacktestConfig {
+            exchange: Some("binance".to_owned()),
+            symbols: Some(vec!["BTCUSDT".to_owned(), "ETHUSDT".to_owned()]),
+            timeframe: Some(timeframe.to_owned()),
+            period_start: Some(start),
+            period_end: Some(end),
+            initial_equity: Some(Decimal::new(10_000, 0)),
+            daily_loss_limit: Some(Decimal::new(500, 0)),
+            lookback: Some(combo.lookback),
+            k: Some(combo.k),
+            ma_period: Some(combo.ma_period),
+            cost_multiplier: Some(cost_multiplier),
+        };
+        run_backtest(pool, config).await.unwrap_or_else(|error| {
+            eprintln!("  combo run failed ({error}); treating as empty");
+            BacktestMetrics {
+                exchange: "binance".to_owned(),
+                symbols: vec![],
+                timeframe: timeframe.to_owned(),
+                period_start: start,
+                period_end: end,
+                initial_equity: Decimal::new(10_000, 0),
+                final_equity: Decimal::new(10_000, 0),
+                realized_pnl: Decimal::ZERO,
+                max_drawdown: Decimal::ZERO,
+                max_drawdown_pct: Decimal::ZERO,
+                trades: 0,
+                wins: 0,
+                losses: 0,
+                candles_loaded: 0,
+                signals_seen: 0,
+            }
+        })
+    }
+
+    /// One full 4-window walk-forward for the trend-filtered breakout on a single
+    /// timeframe. Returns nothing; prints diagnostics + a three-way verdict.
+    async fn walk_forward_breakout_for_timeframe(pool: &PgPool, timeframe: &str) {
+        let grid = walk_forward_grid();
+        let windows: [(i32, u32, i32, u32, i32, u32); 4] = [
+            (2024, 6, 2024, 10, 2024, 12),
+            (2025, 1, 2025, 5, 2025, 7),
+            (2025, 8, 2025, 12, 2026, 2),
+            (2026, 1, 2026, 5, 2026, 7),
+        ];
+        let now = Utc::now();
+
+        eprintln!(
+            "\n############ timeframe = {timeframe} ############\n\
+             grid = {} combos, 4 windows IS 4mo -> OOS 2mo, BTC+ETH, fee-aware, \
+             min trades/window = {}.",
+            grid.len(),
+            MR_MIN_TRADES,
+        );
+
+        let mut oos_results: Vec<f64> = Vec::new();
+        let mut oos_expectancies: Vec<f64> = Vec::new();
+        let mut window_trade_counts: Vec<u64> = Vec::new();
+
+        for (idx, w) in windows.iter().enumerate() {
+            let is_start = Utc.with_ymd_and_hms(w.0, w.1, 1, 0, 0, 0).unwrap();
+            let oos_start = Utc.with_ymd_and_hms(w.2, w.3, 1, 0, 0, 0).unwrap();
+            let mut oos_end = Utc.with_ymd_and_hms(w.4, w.5, 1, 0, 0, 0).unwrap();
+            if oos_end > now {
+                oos_end = now;
+            }
+
+            // IS-best among combos clearing the trade floor (same rule as MR).
+            let mut is_metrics: Vec<(Combo, BacktestMetrics)> = Vec::new();
+            for &combo in &grid {
+                let m = run_combo_tf(pool, timeframe, is_start, oos_start, combo, 1.0).await;
+                is_metrics.push((combo, m));
+            }
+            let pick = is_metrics
+                .iter()
+                .filter(|(_, m)| m.trades >= MR_MIN_TRADES)
+                .max_by(|a, b| pnl_f64(&a.1).partial_cmp(&pnl_f64(&b.1)).unwrap());
+            let Some((best, best_is)) = pick else {
+                eprintln!(
+                    "\nWindow {}: IS {}..{} -> OOS {}..{}\n  NO IS combo cleared {} trades — INCONCLUSIVE window.",
+                    idx + 1,
+                    is_start.date_naive(),
+                    oos_start.date_naive(),
+                    oos_start.date_naive(),
+                    oos_end.date_naive(),
+                    MR_MIN_TRADES,
+                );
+                oos_results.push(0.0);
+                oos_expectancies.push(0.0);
+                window_trade_counts.push(0);
+                continue;
+            };
+
+            let oos_1x = run_combo_tf(pool, timeframe, oos_start, oos_end, *best, 1.0).await;
+            let oos_2x = run_combo_tf(pool, timeframe, oos_start, oos_end, *best, 2.0).await;
+            let oos_3x = run_combo_tf(pool, timeframe, oos_start, oos_end, *best, 3.0).await;
+            oos_results.push(pnl_f64(&oos_1x));
+            oos_expectancies.push(expectancy(&oos_1x));
+            window_trade_counts.push(oos_1x.trades);
+
+            eprintln!(
+                "\nWindow {}: IS {}..{} -> OOS {}..{}",
+                idx + 1,
+                is_start.date_naive(),
+                oos_start.date_naive(),
+                oos_start.date_naive(),
+                oos_end.date_naive()
+            );
+            eprintln!(
+                "  IS-best: lookback={} k={} ma_period={}  IS PnL={:.2} IS trades={}",
+                best.lookback,
+                best.k,
+                best.ma_period,
+                pnl_f64(best_is),
+                best_is.trades,
+            );
+            eprintln!(
+                "  OOS PnL: 1x={:.2}  2x={:.2}  3x={:.2}  | OOS trades={} wins={} losses={} expectancy={:.4}",
+                pnl_f64(&oos_1x),
+                pnl_f64(&oos_2x),
+                pnl_f64(&oos_3x),
+                oos_1x.trades,
+                oos_1x.wins,
+                oos_1x.losses,
+                expectancy(&oos_1x),
+            );
+        }
+
+        let n = oos_results.len() as f64;
+        let mean = oos_results.iter().sum::<f64>() / n;
+        let med = median(oos_results.clone());
+        let worst = oos_results.iter().copied().fold(f64::INFINITY, f64::min);
+        let positive = oos_results.iter().filter(|&&p| p > 0.0).count();
+        let below_floor = window_trade_counts
+            .iter()
+            .filter(|&&t| t < MR_MIN_TRADES)
+            .count();
+        let positive_expectancy = oos_expectancies.iter().filter(|&&e| e > 0.0).count();
+
+        eprintln!("\n=== {timeframe} OOS SUMMARY (1x cost) ===");
+        eprintln!("  per-window PnL:        {oos_results:?}");
+        eprintln!("  per-window expectancy: {oos_expectancies:?}");
+        eprintln!("  per-window trades:     {window_trade_counts:?}");
+        eprintln!(
+            "  mean={mean:.2} median={med:.2} worst={worst:.2} positive={positive}/4 \
+             positive_expectancy={positive_expectancy}/4 windows_below_{MR_MIN_TRADES}_trades={below_floor}"
+        );
+
+        let verdict = if below_floor > 0 {
+            "INCONCLUSIVE — at least one window below the trade floor; too few trades \
+             to test fairly on this timeframe. NOT a falsification."
+        } else if positive == 4 && positive_expectancy == 4 && mean > 0.0 {
+            "POSSIBLE EDGE — all 4 windows positive with positive expectancy. Do NOT adopt; \
+             require a fresh holdout window + 2x-cost survival first."
+        } else {
+            "FAIL (no edge) — sufficient trades but not consistently positive after fees. \
+             Clean falsification -> STOP."
+        };
+        eprintln!("=== {timeframe} VERDICT ===\n  {verdict}");
+    }
+
+    #[tokio::test]
+    #[ignore = "walk-forward replay over the production candle DB; run explicitly"]
+    async fn walk_forward_breakout_higher_timeframes() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping walk-forward; DATABASE_URL is not set");
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await
+            .expect("connect candle database");
+
+        eprintln!(
+            "=== Walk-forward: trend-filtered breakout on higher timeframes (5m, 1h) ===\n\
+             Re-running the 1m grid on rolled-up candles to test whether lower trade \
+             frequency (less fee drag) reveals an edge the 1m runs lacked."
+        );
+        for timeframe in ["5m", "1h"] {
+            walk_forward_breakout_for_timeframe(&pool, timeframe).await;
+        }
+    }
 }
