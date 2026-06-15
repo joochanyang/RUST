@@ -30,28 +30,38 @@ only). The image must be built on the host because the dev machine is arm64.
 git clone git@github.com:joochanyang/RUST.git ~/RUST   # or https with a PAT
 cd ~/RUST/trading-system    # git root is the parent; the crate is in trading-system/
 
-# 2. set the dedicated capture DB password (used by both services)
-export CAPTURE_DB_PASSWORD='<choose-a-strong-password>'
+# 2. set the dedicated capture DB password into a gitignored .env that compose
+#    reads for ${CAPTURE_DB_PASSWORD}. NOTE: compose's project dir defaults to
+#    the compose file's location (deploy/), so .env in trading-system/ is NOT
+#    auto-loaded — pass --env-file explicitly on every command (below).
+printf 'CAPTURE_DB_PASSWORD=%s\n' "$(openssl rand -hex 24)" > .env && chmod 600 .env
 
 # 3. build + start (dedicated trading-capture-postgres + trading-capture)
-docker compose -f deploy/docker-compose.capture.yml up -d --build
+docker compose --env-file .env -f deploy/docker-compose.capture.yml up -d --build
 
 # 4. watch it come up (migrations run on startup via RUN_MIGRATIONS=true)
-docker compose -f deploy/docker-compose.capture.yml logs -f capture
+docker compose --env-file .env -f deploy/docker-compose.capture.yml logs -f capture
 ```
 
 ## Health / monitoring
 
-```sh
-# in-container health endpoint (not exposed externally by design)
-docker compose -f deploy/docker-compose.capture.yml exec capture \
-  wget -qO- http://127.0.0.1:8080/api/health
+The runtime image is `debian:bookworm-slim` (no `wget`/`curl`), and the health
+endpoint binds loopback-only inside the container (not exposed). The real
+liveness signal for a capture service is the **DB insert rate**: each (exchange,
+symbol) feed should write ~1 row/sec (the 1s sampling). A collapse toward 0
+means a stream stall — the per-stream staleness reconnect should self-heal it;
+if not, `docker compose --env-file .env -f deploy/docker-compose.capture.yml restart capture`.
 
-# insert rate + freshness (a collapse = a stall the staleness reconnect should
-# self-heal; if not, restart the capture service)
-docker compose -f deploy/docker-compose.capture.yml exec capture-postgres \
-  psql -U trading -d trading_system -c \
-  "SELECT exchange, symbol, count(*), max(event_time) FROM order_books GROUP BY 1,2 ORDER BY 1,2;"
+```sh
+# rows/sec per feed (healthy ≈ 1.0) + freshness; also watch row growth over time
+docker exec trading-capture-postgres psql -U trading -d trading_system -c \
+  "SELECT exchange, symbol, count(*) AS rows,
+          round(count(*)::numeric / GREATEST(extract(epoch FROM (max(event_time)-min(event_time))),1),2) AS per_sec,
+          max(event_time) AS latest
+   FROM order_books GROUP BY 1,2 ORDER BY 1,2;"
+
+# disk (order_books grows ~50-100MB/day at 1s sampling across 6 feeds)
+df -h / && docker system df -v | grep capture-pgdata
 ```
 
 ## When enough data has accumulated (weeks later)

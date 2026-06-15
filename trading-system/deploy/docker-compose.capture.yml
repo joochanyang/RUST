@@ -2,14 +2,15 @@
 # market data into a DEDICATED Postgres (isolated from the other per-project
 # Postgres containers on the box), places NO orders.
 #
-#   # on Hetzner, from the repo root:
-#   docker compose -f deploy/docker-compose.capture.yml up -d --build
-#   # logs / health:
-#   docker compose -f deploy/docker-compose.capture.yml logs -f capture
+#   # on Hetzner, from trading-system/ (NOT the repo root — the crate lives there):
+#   printf 'CAPTURE_DB_PASSWORD=%s\n' "$(openssl rand -hex 24)" > .env && chmod 600 .env
+#   docker compose --env-file .env -f deploy/docker-compose.capture.yml up -d --build
+#   docker compose --env-file .env -f deploy/docker-compose.capture.yml logs -f capture
 #
-# Set CAPTURE_DB_PASSWORD in the environment (or a .env beside this file) before
-# `up`. The capture service waits for Postgres to be healthy, then applies the
-# embedded migrations (RUN_MIGRATIONS=true) on startup.
+# NOTE: --env-file .env is required — compose's project dir defaults to this
+# file's location (deploy/), so a .env in trading-system/ is not auto-loaded.
+# The capture service waits for Postgres to be healthy, then applies the embedded
+# migrations (RUN_MIGRATIONS=true) on startup.
 #
 # WHY no-trade (see configs/capture-only.env header for the source trace):
 #   TRADING_MODE=paper + PAPER_TRADING_ENABLED=false + BINANCE_TESTNET_ENABLED=false
