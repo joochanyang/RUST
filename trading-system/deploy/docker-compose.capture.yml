@@ -1,0 +1,69 @@
+# Capture-only deployment for Hetzner: ingests + downsamples order-book / candle
+# market data into a DEDICATED Postgres (isolated from the other per-project
+# Postgres containers on the box), places NO orders.
+#
+#   # on Hetzner, from the repo root:
+#   docker compose -f deploy/docker-compose.capture.yml up -d --build
+#   # logs / health:
+#   docker compose -f deploy/docker-compose.capture.yml logs -f capture
+#
+# Set CAPTURE_DB_PASSWORD in the environment (or a .env beside this file) before
+# `up`. The capture service waits for Postgres to be healthy, then applies the
+# embedded migrations (RUN_MIGRATIONS=true) on startup.
+#
+# WHY no-trade (see configs/capture-only.env header for the source trace):
+#   TRADING_MODE=paper + PAPER_TRADING_ENABLED=false + BINANCE_TESTNET_ENABLED=false
+#   => neither the paper nor the testnet order loop is spawned; events only persist.
+
+services:
+  capture-postgres:
+    image: postgres:16-alpine
+    container_name: trading-capture-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: trading_system
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD: ${CAPTURE_DB_PASSWORD:?set CAPTURE_DB_PASSWORD}
+    volumes:
+      - capture-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading -d trading_system"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  capture:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: trading-capture:latest
+    container_name: trading-capture
+    restart: unless-stopped
+    depends_on:
+      capture-postgres:
+        condition: service_healthy
+    environment:
+      # Loopback inside the container: the dashboard/health server is not exposed
+      # (capture needs no external HTTP), which also avoids the non-loopback
+      # DASHBOARD_CONTROL_TOKEN requirement in settings.rs. Health, if needed:
+      #   docker compose -f deploy/docker-compose.capture.yml exec capture \
+      #     wget -qO- http://127.0.0.1:8080/api/health
+      API_HOST: 127.0.0.1
+      API_PORT: "8080"
+      DATABASE_URL: postgres://trading:${CAPTURE_DB_PASSWORD:?set CAPTURE_DB_PASSWORD}@capture-postgres:5432/trading_system
+      DATABASE_MAX_CONNECTIONS: "5"
+      RUN_MIGRATIONS: "true"
+      MARKET_DATA_ENABLED: "true"
+      MARKET_DATA_EXCHANGES: "binance,bybit,bitget"
+      MARKET_DATA_SYMBOLS: "BTCUSDT,ETHUSDT"
+      # 1 row per (exchange, symbol) per second — fits Hetzner's disk for months.
+      MARKET_DATA_ORDERBOOK_SAMPLE_SECS: "1"
+      PAPER_TRADING_ENABLED: "false"
+      BINANCE_TESTNET_ENABLED: "false"
+      TRADING_MODE: "paper"
+      LIVE_TRADING_APPROVED: "false"
+      AI_FILTER_ENABLED: "false"
+      RUST_LOG: "trading_api=info,info"
+
+volumes:
+  capture-pgdata:

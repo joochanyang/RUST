@@ -1,0 +1,6 @@
+# Keep the build context small and reproducible: never ship local build output,
+# git history, or secrets into the image build.
+target/
+.git/
+.env
+**/*.log
