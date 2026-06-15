@@ -222,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
                 pool.clone(),
                 strategy_sender.clone(),
                 notification_sender.clone(),
+                settings.market_data.orderbook_sample_secs,
             ));
         }
 
@@ -235,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
                 pool.clone(),
                 strategy_sender.clone(),
                 notification_sender.clone(),
+                settings.market_data.orderbook_sample_secs,
             ));
         }
 
@@ -248,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
                 pool.clone(),
                 strategy_sender.clone(),
                 notification_sender.clone(),
+                settings.market_data.orderbook_sample_secs,
             ));
         }
 

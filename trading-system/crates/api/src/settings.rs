@@ -35,6 +35,9 @@ pub struct MarketDataSettings {
     pub enabled: bool,
     pub exchanges: Vec<String>,
     pub symbols: Vec<String>,
+    /// Persist at most one order-book row per (exchange, symbol) per this many
+    /// seconds. 0 = persist every event (default; trading paths unaffected).
+    pub orderbook_sample_secs: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +96,14 @@ impl Settings {
             enabled: parse_bool(&env_value("MARKET_DATA_ENABLED", "false"))?,
             exchanges: parse_csv_lower(&env_value("MARKET_DATA_EXCHANGES", "binance,bybit,bitget")),
             symbols: parse_csv(&env_value("MARKET_DATA_SYMBOLS", "BTCUSDT,ETHUSDT")),
+            orderbook_sample_secs: env_value("MARKET_DATA_ORDERBOOK_SAMPLE_SECS", "0")
+                .parse()
+                .context("MARKET_DATA_ORDERBOOK_SAMPLE_SECS must be a non-negative integer")?,
         };
+
+        if market_data.orderbook_sample_secs < 0 {
+            bail!("MARKET_DATA_ORDERBOOK_SAMPLE_SECS must be >= 0");
+        }
 
         if market_data.enabled && market_data.symbols.is_empty() {
             bail!("MARKET_DATA_SYMBOLS must not be empty when MARKET_DATA_ENABLED=true");
