@@ -1,6 +1,6 @@
 # PROGRESS — trading-system (Rust 코인선물 AI 트레이딩)
 
-> 마지막 갱신: 2026-06-16 (📡**오더북-임밸런스 가설용 장기 캐처 — 선결 코드 3건 완료·푸시**: per-stream staleness 재연결(`6056de3`)+무거래 템플릿(`7f05862`)+1초 다운샘플(`2536828`). 거래/전략/캔들/latency 경로 전부 불변(적대적 검증). 133 passed. **결정 완료(사용자)**: 배포=**Hetzner**, 저장=**1초 샘플링**(Hetzner 63G 여유라 raw면 ~2주 꿉참). **다음=Hetzner 배포**(PG에 trading_system DB 생성→바이너리 배포⚠️SSH docker build금지→capture-only.env→가동·모니터). 상세=「📡 진행 중」섹션. ▼이전: 🛑**가격방향 탐색 종료**(4계열 falsify 수용, 검증 인프라 영구 보존). 상세=🛑 박스. ▼더 이전: ★★★**일봉(1d) 돌파도 effectively-FAIL — 돌파/평균회귀 계열 4번째 falsify, BTC/ETH 2023-26 레짐에서 가격방향 엣지 없음 확정**. 1d WFO 3윈도우(IS12mo→OOS6mo, 60일 pre-roll, n=3 verdict) 실행: 기계판정=INCONCLUSIVE(2윈도우 floor미달)였으나, **풀링하면 powered FAIL**: 53거래·15승(28.3%)·1x PnL−66.46·P(≤15승|공정동전)=0.0011. floor 미달 윈도우 둘 다 0근처 아닌 **유의한 음수**(−46.89/−29.51)라 floor가 증거를 은폐 중이었음. 유일 양수 W3(+9.94)은 2×비용서 −0.08 사망. IS-best 3개 다 음수+파라미터 텔레포트=오버핏 시그니처. 라이브 불변). **★★다음 세션=구조적으로 다른(가격방향이 아닌) 가설 or 멈춤** — "🚀 다음 세션 첫 액션" 읽기. ⭐일봉 검증 인프라(pre-roll `eval_start`·n=3 verdict·1d 롤업)는 영구 유지, 커밋됨.
+> 마지막 갱신: 2026-06-16 (📡**오더북-임밸런스 가설용 장기 캐처 — 선결 코드 3건 완료·푸시**: per-stream staleness 재연결(`6056de3`)+무거래 템플릿(`7f05862`)+1초 다운샘플(`2536828`). 거래/전략/캔들/latency 경로 전부 불변(적대적 검증). 133 passed. **결정 완료(사용자)**: 배포=**Hetzner**, 저장=**1초 샘플링**(Hetzner 63G 여유라 raw면 ~2주 꿉참). **배포 아티팩트 완료·빌드검증(`cb6218e`)**: `deploy/`(Dockerfile·compose·README·.dockerignore), 로컬 풀빌드 통과(167MB). **다음=Hetzner에서 런북 실행**(git clone→`docker compose up -d --build`→모니터). 유일 미결=서버 git 인증 방식. 상세=「📡 진행 중」섹션. ▼이전: 🛑**가격방향 탐색 종료**(4계열 falsify 수용, 검증 인프라 영구 보존). 상세=🛑 박스. ▼더 이전: ★★★**일봉(1d) 돌파도 effectively-FAIL — 돌파/평균회귀 계열 4번째 falsify, BTC/ETH 2023-26 레짐에서 가격방향 엣지 없음 확정**. 1d WFO 3윈도우(IS12mo→OOS6mo, 60일 pre-roll, n=3 verdict) 실행: 기계판정=INCONCLUSIVE(2윈도우 floor미달)였으나, **풀링하면 powered FAIL**: 53거래·15승(28.3%)·1x PnL−66.46·P(≤15승|공정동전)=0.0011. floor 미달 윈도우 둘 다 0근처 아닌 **유의한 음수**(−46.89/−29.51)라 floor가 증거를 은폐 중이었음. 유일 양수 W3(+9.94)은 2×비용서 −0.08 사망. IS-best 3개 다 음수+파라미터 텔레포트=오버핏 시그니처. 라이브 불변). **★★다음 세션=구조적으로 다른(가격방향이 아닌) 가설 or 멈춤** — "🚀 다음 세션 첫 액션" 읽기. ⭐일봉 검증 인프라(pre-roll `eval_start`·n=3 verdict·1d 롤업)는 영구 유지, 커밋됨.
 
 ## 🛑 결정 — 가격방향 탐색 정직하게 종료 (2026-06-16, 사용자 확정)
 **트리거 문구: "rust 트레이딩 이어서 작업" → 먼저 이 박스를 읽을 것**
@@ -24,12 +24,14 @@
 >
 > **★결정 완료(사용자 2026-06-16)**: 배포=**Hetzner**(`5.161.112.248`)에 캐처+DB 함께. 저장=**1초 샘플링**(풀해상도 raw 대신 — Hetzner 디스크 63G 여유뿐, raw면 ~2주에 꿉참; 1초면 몇 달 OK). 리텐션 정책=1초 샘플링으로 해소(추가 프루닝 불필요).
 >
-> **🚀 다음 세션 첫 액션 — Hetzner 캐처 배포 (순서대로)**:
-> 1. **Hetzner 점검 재확인**(이미 1회 함, 2026-06-16): 디스크 150G 중 63G 여유, mem 7.6G(4G avail), Postgres 컨테이너 4개 가동중이나 **trading_system DB는 없음**(맥북 로컬에만 존재). → 캐처용 Postgres를 Hetzner에 새로 띄우거나 기존 PG에 `trading_system` DB 생성 + 마이그레이션(`RUN_MIGRATIONS=true`가 자동 적용) 결정.
-> 2. **Rust 바이너리 배포**: ⚠️**함정=SSH에서 docker build 금지**(credsStore desktop, 메모리 기록) → schtasks/로컬빌드 후 이미지 푸시 등 우회 필요. 또는 Hetzner에서 직접 `cargo build --release`(rust 툴체인 확인).
-> 3. **`.env`=capture-only**: `cp configs/capture-only.env .env`, DATABASE_URL=Hetzner PG, 대시보드 시크릿 채움. (`MARKET_DATA_ORDERBOOK_SAMPLE_SECS=1` 이미 템플릿에 있음.)
-> 4. **가동 + 헬스 모니터**: `RUST_LOG=trading_api=info`. 분당 `order_books` insert rate / `MAX(event_time)` 모니터(절벽=stall 탐지). 디스크 증가율도 모니터(1초 샘플링이 예상대로 ~50-100MB/일급인지 확인).
-> 5. **데이터 충분해지면**(몇 주 후): imbalance 가설을 **사전등록 데이터분석부터**(imbalance가 다음 N분 수익률 예측? IC·분위수) → 신호 있으면 전략 구현+동일 WFO+OOS+수수료+적대적리뷰, 없으면 근거 있는 기각. ⚠️같은 family-wise 규율.
+> **★배포 아티팩트 완료·빌드검증·푸시(`cb6218e`)**: `deploy/Dockerfile`(멀티스테이지)+`deploy/docker-compose.capture.yml`(전용 `trading-capture-postgres`+capture 서비스·무거래 env·1초 샘플링)+`deploy/README.md`(런북)+`.dockerignore`. **로컬 풀 릴리스 빌드 통과(1m01s·167MB 런타임 이미지)**. ⚠빌더는 `rust:1-slim-bookworm`(1.78은 의존성 edition2024 요구로 실패). 마이그레이션 컴파일타임 임베드→런타임 이미지에 `migrations/` 불필요, `RUN_MIGRATIONS=true` 기동 시 적용. **Hetzner docker build 됨**(credsStore 함정=홈서버 전용, Hetzner엔 없음·smoke 통과).
+>
+> **🚀 다음 세션 첫 액션 — Hetzner에서 런북 실행 (전부 운영 작업, `deploy/README.md` 그대로)**:
+> 1. **코드 가져오기**: Hetzner에서 `git clone`(remote=`joochanyang/RUST`). ⚠️**rsync 워킹트리 금지**(안전분류기가 exfiltration으로 막음·실측) → git clone만. 서버 git 인증 필요.
+> 2. **기동**: `export CAPTURE_DB_PASSWORD=...` → `cd trading-system && docker compose -f deploy/docker-compose.capture.yml up -d --build`. 전용 Postgres 새로 띄움(기존 4개 PG와 격리), 마이그레이션 자동.
+> 3. **검증·모니터**: 헬스(`exec capture wget -qO- 127.0.0.1:8080/api/health`)·insert율/freshness(`exec capture-postgres psql ...GROUP BY exchange,symbol`)·디스크 증가율(1초 샘플링이 ~50-100MB/일급인지). 절벽=stall(staleness 수정이 자가복구, 안 되면 재시작).
+> 4. **데이터 충분해지면**(몇 주 후): imbalance 가설을 **사전등록 데이터분석부터**(imbalance가 다음 N분 수익률 예측? IC·분위수) → 신호 있으면 전략 구현+동일 WFO+OOS+수수료+적대적리뷰, 없으면 근거 있는 기각. ⚠️같은 family-wise 규율.
+> **⚠️미결(다음 세션 첫 결정)**: Hetzner 서버 git 인증 방식(deploy key/PAT). 그 외 배포 결정은 다 끝남(전용 PG·이미지 빌드 방식·env 전부 아티팩트에 박제).
 > **⚠️비차단 한계(캐처엔 무방, 라이브 전 재검토)**: bybit `tickers.*`=델타채널→top-of-book 안 변해도 staleness/샘플 갱신됨. 백프레셔(DB 멈춤) 동안 staleness 탐지 지연. 상세=메모리 파일.
 
 ### 🚀 (참고·보존) 멈춤 직전 다음 액션 메모 — ★가격방향이 아닌 구조적으로 다른 가설, or 멈춤
