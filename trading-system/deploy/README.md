@@ -73,6 +73,11 @@ a container stuck non-crashed, a stopped postgres, or disk filling. Every 5 min
 the watchdog: brings containers back up if down, restarts capture if
 `order_books` freshness exceeds `STALL_SECS` (180s; healthy is <1s), and warns
 (log only — never auto-deletes) if the root fs exceeds `DISK_WARN_PCT` (85%).
+Hourly it also checks the imbalance data-sufficiency gate and logs `GATE ready`
+once all 18 feed×horizon clear the `GATE_FLOOR` (2000) non-overlapping samples
+(else `gate waiting: N/18`); it latches after ready so it stops re-checking.
+This is log-only — running `deploy/analysis/*.sql` is still a human decision
+(grep the log: `grep GATE /var/log/trading-capture-watchdog.log`).
 
 Install on the host (script lives in the repo; copy to `/opt` to match the
 server's cron convention):
