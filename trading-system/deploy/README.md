@@ -19,6 +19,23 @@ disk (~63G as of 2026-06-16) in ~2 weeks. `MARKET_DATA_ORDERBOOK_SAMPLE_SECS=1`
 keeps one row per (exchange, symbol) per second (~50–100× less), so a multi-month
 capture fits. Still monitor disk and the insert rate.
 
+> ⚠️ **DO NOT wipe the capture volume during Docker cleanup.** The accumulated
+> data lives ONLY in the named volume `deploy_capture-pgdata` (Docker project
+> `deploy`). It survives container restarts but is destroyed by
+> `docker compose ... down -v`, `docker volume rm deploy_capture-pgdata`, or
+> `docker volume prune` with `--all`/`-a` against in-use-but-recreated stacks.
+> **This already bit us once (2026-06-16): a routine `docker system prune` /
+> `down -v` during a disk cleanup deleted the volume and reset the multi-week
+> capture to 0** (volume re-created 02:03 KST, only ~9.5h of data left). The
+> capture is worthless until the volume holds *weeks* of continuous data, so a
+> single accidental wipe sets the whole study back to square one.
+>
+> Safe cleanup on this host: `docker image prune -a` and `docker builder prune`
+> are fine. **NEVER** run `docker volume prune` (any flag), `docker system prune
+> --volumes`, or `docker compose -f deploy/docker-compose.capture.yml down -v`
+> while the capture is the active study. To restart the service without data
+> loss use `... restart capture` or `... up -d` (no `down -v`).
+
 ## Deploy on Hetzner (5.161.112.248, x86_64)
 
 `docker build` works on this host (the SSH-build credsStore trap is home-server
