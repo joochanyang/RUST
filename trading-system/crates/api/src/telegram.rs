@@ -36,6 +36,7 @@ impl TelegramClient {
             .json(&json!({
                 "chat_id": chat_id,
                 "text": text.into(),
+                "parse_mode": "Markdown",
                 "disable_web_page_preview": true
             }))
             .send()

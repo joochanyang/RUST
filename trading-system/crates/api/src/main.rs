@@ -6,6 +6,7 @@ mod execution_repository;
 mod live_readiness;
 mod market_ingestion;
 mod market_repository;
+mod notify_format;
 mod paper_trading;
 mod risk_event_repository;
 mod settings;

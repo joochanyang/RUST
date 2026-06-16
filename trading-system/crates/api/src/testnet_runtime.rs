@@ -25,6 +25,7 @@ use crate::{
         load_open_protected_orders_by_mode_and_position, mark_position_closed_without_exit,
         persist_protected_order, update_open_position_marks,
     },
+    notify_format,
     risk_event_repository::{persist_ai_block_risk_event, persist_risk_event},
     signal_repository::persist_signal,
     telegram::NotificationSender,
@@ -57,13 +58,13 @@ pub async fn run_binance_testnet_strategy_loop(
         tracing::warn!(%error, "failed to fetch Binance testnet account snapshot at startup");
         notify(
             &notifications,
-            format!("Binance testnet account check failed: {error}"),
+            notify_format::account_check_failed(&error.to_string()),
         )
         .await;
     } else {
         notify(
             &notifications,
-            "Binance testnet account connected".to_owned(),
+            notify_format::frame_simple("🟢 *Testnet 봇 가동*", "거래소 계정 연결됨"),
         )
         .await;
     }
@@ -93,14 +94,7 @@ pub async fn run_binance_testnet_strategy_loop(
     // almost always violates stepSize and the exchange rejects the order (-1111).
     let symbol_filters = match adapter.fetch_symbol_filters(&[]).await {
         Ok(filters) => {
-            notify(
-                &notifications,
-                format!(
-                    "Binance testnet exchange filters loaded ({} symbols)",
-                    filters.len()
-                ),
-            )
-            .await;
+            notify(&notifications, notify_format::filters_loaded(filters.len())).await;
             filters
         }
         Err(error) => {
@@ -113,7 +107,10 @@ pub async fn run_binance_testnet_strategy_loop(
             }
             notify(
                 &notifications,
-                format!("\u{1f6a8} CRITICAL: cannot load exchange filters; runtime LOCKED\nreason: {error}"),
+                notify_format::critical_lock(
+                    "거래소 필터 로드 실패 — 런타임 LOCKED",
+                    &notify_format::reason_row(&error.to_string()),
+                ),
             )
             .await;
             std::collections::HashMap::new()
@@ -126,10 +123,7 @@ pub async fn run_binance_testnet_strategy_loop(
             if !keys.is_empty() {
                 notify(
                     &notifications,
-                    format!(
-                        "restored {} open Binance testnet position key(s)",
-                        keys.len()
-                    ),
+                    notify_format::positions_restored(keys.len()),
                 )
                 .await;
             }
@@ -145,8 +139,9 @@ pub async fn run_binance_testnet_strategy_loop(
             }
             notify(
                 &notifications,
-                format!(
-                    "\u{1f6a8} CRITICAL: cannot restore Binance testnet open positions; runtime LOCKED\nreason: {error}"
+                notify_format::critical_lock(
+                    "오픈 포지션 복원 실패 — 런타임 LOCKED",
+                    &notify_format::reason_row(&error.to_string()),
                 ),
             )
             .await;
@@ -180,13 +175,8 @@ pub async fn run_binance_testnet_strategy_loop(
                     {
                         Ok(closed) => {
                             open_position_keys.remove(&key);
-                            notify(
-                                &notifications,
-                                format!(
-                                    "position sweep: {key} closed on exchange while offline; reconciled {closed} DB position(s) to closed"
-                                ),
-                            )
-                            .await;
+                            notify(&notifications, notify_format::position_sweep(&key, closed))
+                                .await;
                         }
                         Err(error) => {
                             tracing::error!(%error, %key, "position sweep failed to reconcile orphaned position");
@@ -264,12 +254,7 @@ pub async fn run_binance_testnet_strategy_loop(
                 }
                 notify(
                     &notifications,
-                    format!(
-                        "testnet AI block\nsymbol: {}\nside: {}\nreason: {}",
-                        signal.symbol.as_str(),
-                        signal.side.as_str(),
-                        reason
-                    ),
+                    notify_format::ai_block(signal.symbol.as_str(), signal.side.as_str(), &reason),
                 )
                 .await;
                 continue;
@@ -280,11 +265,10 @@ pub async fn run_binance_testnet_strategy_loop(
                 Err(error) => {
                     notify(
                         &notifications,
-                        format!(
-                            "testnet signal blocked\nsymbol: {}\nside: {}\nreason: {}",
+                        notify_format::signal_blocked(
                             signal.symbol.as_str(),
                             signal.side.as_str(),
-                            error
+                            &error.to_string(),
                         ),
                     )
                     .await;
@@ -314,8 +298,7 @@ pub async fn run_binance_testnet_strategy_loop(
             if !filters.is_tradeable(quantity, reference_price) {
                 notify(
                     &notifications,
-                    format!(
-                        "testnet entry skipped (below exchange minimums)\nsymbol: {}\nside: {}\nqty: {}\nnotional: {}",
+                    notify_format::entry_skipped_minimums(
                         signal.symbol.as_str(),
                         signal.side.as_str(),
                         quantity,
@@ -372,11 +355,10 @@ pub async fn run_binance_testnet_strategy_loop(
                 Err(error) => {
                     notify(
                         &notifications,
-                        format!(
-                            "Binance testnet order failed\nsymbol: {}\nside: {}\nreason: {}",
+                        notify_format::order_failed(
                             signal.symbol.as_str(),
                             signal.side.as_str(),
-                            error
+                            &error.to_string(),
                         ),
                     )
                     .await;
@@ -481,11 +463,14 @@ async fn handle_protection_failure(
     );
     notify(
         notifications,
-        format!(
-            "\u{1f6a8} CRITICAL: testnet protection FAILED\nsymbol: {}\nside: {}\nqty: {}\nprotection error: {protection_error}\n{flatten_summary}\nruntime LOCKED",
-            symbol.as_str(),
-            side.as_str(),
-            quantity,
+        notify_format::critical_lock(
+            "보호주문 실패 — 런타임 LOCKED",
+            &notify_format::lock_body(
+                symbol.as_str(),
+                side.as_str(),
+                quantity,
+                &format!("보호 오류: `{protection_error}`\n{flatten_summary}"),
+            ),
         ),
     )
     .await;
@@ -539,11 +524,14 @@ async fn handle_entry_timeout(
     );
     notify(
         notifications,
-        format!(
-            "\u{1f6a8} CRITICAL: testnet entry order TIMED OUT (outcome unknown)\nsymbol: {}\nside: {}\nqty: {}\nthe order may have filled on the exchange — reconcile manually\nruntime LOCKED",
-            symbol.as_str(),
-            side.as_str(),
-            quantity,
+        notify_format::critical_lock(
+            "진입 주문 TIMEOUT (결과 불명) — 런타임 LOCKED",
+            &notify_format::lock_body(
+                symbol.as_str(),
+                side.as_str(),
+                quantity,
+                "⚠️ 거래소에서 체결됐을 수 있음 — 수동 reconcile 필요",
+            ),
         ),
     )
     .await;
@@ -649,11 +637,14 @@ async fn finalize_entry_with_protection(
         }
         notify(
             notifications,
-            format!(
-                "\u{1f6a8} CRITICAL: testnet protected position persisted FAILED\nsymbol: {}\nside: {}\nqty: {}\nruntime LOCKED\nreason: {error}",
-                symbol.as_str(),
-                side.as_str(),
-                quantity,
+            notify_format::critical_lock(
+                "보호 포지션 DB 저장 실패 — 런타임 LOCKED",
+                &notify_format::lock_body(
+                    symbol.as_str(),
+                    side.as_str(),
+                    quantity,
+                    &format!("사유: `{error}`"),
+                ),
             ),
         )
         .await;
@@ -683,14 +674,13 @@ async fn finalize_entry_with_protection(
 
     notify(
         notifications,
-        format!(
-            "Binance testnet entry submitted\nsymbol: {}\nside: {}\nqty: {}\nstatus: {}\nstop: {}\ntake: {}",
+        notify_format::entry_submitted(
             symbol.as_str(),
             side.as_str(),
             quantity,
-            order.status,
+            &order.status.to_string(),
             stop_loss_price,
-            take_profit_price
+            take_profit_price,
         ),
     )
     .await;
@@ -858,8 +848,7 @@ async fn reconcile_entry_timeout(
         Ok(Some(order)) if order_is_filled(&order) => {
             notify(
                 notifications,
-                format!(
-                    "Binance testnet entry timed out but RECONCILED as filled\nsymbol: {}\nside: {}\nqty: {}\nplacing protection…",
+                notify_format::entry_reconciled_filled(
                     symbol.as_str(),
                     side.as_str(),
                     order.executed_quantity,
@@ -895,11 +884,7 @@ async fn reconcile_entry_timeout(
         Ok(_) => {
             notify(
                 notifications,
-                format!(
-                    "Binance testnet entry timed out; reconciled as NOT filled — safe to skip\nsymbol: {}\nside: {}",
-                    symbol.as_str(),
-                    side.as_str(),
-                ),
+                notify_format::entry_reconciled_not_filled(symbol.as_str(), side.as_str()),
             )
             .await;
             ReconcileOutcome::Skipped
