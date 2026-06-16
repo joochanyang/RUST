@@ -819,18 +819,24 @@ async fn run_public_market_stream_once(
     })?;
     let (_, mut read) = stream.split();
 
-    // Receive-time of the most recent order-book frame on THIS connection. The
-    // whole-socket idle timeout below resets on any frame (ping/kline included),
-    // so it cannot see a bookTicker-only stall; tracking the order-book gap
-    // separately is what catches that production failure mode.
+    // Receive-time of the most recent PRIMARY frame on THIS connection. The whole-
+    // socket idle timeout below resets on any frame (ping included), so it cannot
+    // see a partial stall where the data frames stop but pings keep the socket
+    // alive; tracking the primary-frame gap separately is what catches that
+    // production failure mode (observed on BOTH socket types: a bookTicker-only
+    // stall and a kline-only stall that fell 48-70s behind, 2026-06-16).
     //
-    // Anchored to the connect instant on order-book-bearing sockets so a feed
-    // that NEVER (re)starts order-book frames — while kline/pings keep the socket
-    // alive past the idle timeout — is still caught (the partial-stall bug would
-    // otherwise silently reappear one reconnect later). The kline-only socket
-    // passes `false` and stays `None`, leaving its check inert (the whole-socket
-    // idle timeout guards it) so a healthy kline feed never false-reconnects.
-    let mut last_orderbook_at: Option<chrono::DateTime<Utc>> = expects_orderbook.then(Utc::now);
+    // Binance splits feeds onto two sockets: bookTicker (order-book) and kline
+    // (candles). Each guards its OWN primary frame — order book on the bookTicker
+    // socket, candle on the kline socket — so a partial stall on EITHER reconnects.
+    // Anchored to the connect instant so a feed that never (re)starts its primary
+    // frame while pings keep the socket alive is still caught.
+    let mut last_primary_frame_at: Option<chrono::DateTime<Utc>> = Some(Utc::now());
+    let frame_kind = if expects_orderbook {
+        "order-book"
+    } else {
+        "candle"
+    };
     let staleness = chrono::Duration::seconds(trading_core::ORDERBOOK_STREAM_STALENESS_SECS);
 
     loop {
@@ -853,8 +859,15 @@ async fn run_public_market_stream_once(
             Ok(Message::Text(text)) => {
                 let event = parse_market_payload(text.as_ref())?;
                 let now = Utc::now();
-                if matches!(event, MarketEvent::OrderBook(_)) {
-                    last_orderbook_at = Some(now);
+                // Arm the staleness clock on this socket's primary frame: order
+                // book for the bookTicker socket, candle for the kline socket.
+                let is_primary = if expects_orderbook {
+                    matches!(event, MarketEvent::OrderBook(_))
+                } else {
+                    matches!(event, MarketEvent::Candle(_))
+                };
+                if is_primary {
+                    last_primary_frame_at = Some(now);
                 }
                 let observed = trading_core::ObservedMarketEvent::new(event, now);
                 if sender.send(Ok(observed)).await.is_err() {
@@ -872,12 +885,12 @@ async fn run_public_market_stream_once(
             }
         }
 
-        // Partial stall: order-book frames stopped while other frames keep the
-        // socket alive. Surface an error so the caller reconnects rather than
-        // streaming stale data the latency gate would silently block on.
-        if trading_core::orderbook_stream_is_stale(last_orderbook_at, Utc::now(), staleness) {
+        // Partial stall: this socket's primary frames stopped while other frames
+        // (pings) keep it alive. Surface an error so the caller reconnects rather
+        // than streaming stale data the latency gate would silently block on.
+        if trading_core::orderbook_stream_is_stale(last_primary_frame_at, Utc::now(), staleness) {
             return Err(TradingError::Exchange(format!(
-                "Binance order-book stream stalled: no order-book frame within {staleness}"
+                "Binance {frame_kind} stream stalled: no {frame_kind} frame within {staleness}"
             )));
         }
     }

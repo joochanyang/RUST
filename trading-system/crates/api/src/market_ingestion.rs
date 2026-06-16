@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use chrono::Utc;
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 use trading_core::{MarketEvent, ObservedMarketEvent};
@@ -66,6 +67,32 @@ impl OrderbookSampler {
     }
 }
 
+/// How often a latency-warning Telegram alert may be sent per (exchange, symbol).
+/// The latency risk event is still persisted on EVERY breach (diagnostics intact);
+/// only the chat notification is rate-limited. A stalled feed breaches on every
+/// tick (hundreds/sec) — without this, one stall floods the chat with thousands
+/// of identical alerts (observed 2026-06-16).
+const LATENCY_ALERT_THROTTLE_SECS: i64 = 60;
+
+/// Rate-limits latency-warning notifications per (exchange, symbol).
+#[derive(Default)]
+struct LatencyAlertThrottle {
+    last_sent: HashMap<String, i64>,
+}
+
+impl LatencyAlertThrottle {
+    /// Returns true at most once per `LATENCY_ALERT_THROTTLE_SECS` per key.
+    fn should_send(&mut self, key: &str, now_secs: i64) -> bool {
+        match self.last_sent.get(key) {
+            Some(&prev) if now_secs - prev < LATENCY_ALERT_THROTTLE_SECS => false,
+            _ => {
+                self.last_sent.insert(key.to_owned(), now_secs);
+                true
+            }
+        }
+    }
+}
+
 pub async fn run_market_ingestion_with_forwarder(
     mut stream: MarketStream,
     pool: PgPool,
@@ -74,6 +101,7 @@ pub async fn run_market_ingestion_with_forwarder(
     orderbook_sample_secs: i64,
 ) {
     let mut sampler = OrderbookSampler::new(orderbook_sample_secs);
+    let mut latency_alert_throttle = LatencyAlertThrottle::default();
 
     while let Some(message) = stream.recv().await {
         match message {
@@ -98,19 +126,25 @@ pub async fn run_market_ingestion_with_forwarder(
                             "failed to persist market latency risk event"
                         );
                     }
-                    notify(
-                        &notifications,
-                        notify_format::market_latency_warning(
-                            exchange.as_str(),
-                            &symbol.to_string(),
-                            latency_ms,
-                        ),
-                    )
-                    .await;
+                    // Persist every breach (above) but throttle the chat alert,
+                    // or a stalled feed floods Telegram with one message per tick.
+                    let throttle_key = format!("{}:{}", exchange.as_str(), symbol);
+                    if latency_alert_throttle.should_send(&throttle_key, Utc::now().timestamp()) {
+                        notify(
+                            &notifications,
+                            notify_format::market_latency_warning(
+                                exchange.as_str(),
+                                &symbol.to_string(),
+                                latency_ms,
+                            ),
+                        )
+                        .await;
+                    }
                 }
 
                 // Order-book persistence is downsampled (see OrderbookSampler);
-                // candles and the latency path above are never throttled, and the
+                // candles are never throttled. The latency path above persists a
+                // risk event every breach but rate-limits only its chat alert. The
                 // strategy forwarder below always sees every event regardless.
                 if sampler.should_persist(&observed) {
                     if let Err(error) = persist_observed_market_event(&pool, &observed).await {
@@ -258,5 +292,19 @@ mod tests {
             sampler.should_persist(&eth),
             "ETH in the same second is a different key and must persist"
         );
+    }
+
+    #[test]
+    fn latency_alert_throttle_limits_one_per_window_per_key() {
+        let mut t = LatencyAlertThrottle::default();
+        // First breach for a key always sends.
+        assert!(t.should_send("binance:BTCUSDT", 1_000));
+        // A flood within the window is suppressed.
+        assert!(!t.should_send("binance:BTCUSDT", 1_001));
+        assert!(!t.should_send("binance:BTCUSDT", 1_000 + LATENCY_ALERT_THROTTLE_SECS - 1));
+        // A different feed is independent.
+        assert!(t.should_send("binance:ETHUSDT", 1_001));
+        // After the window elapses, the same key sends again.
+        assert!(t.should_send("binance:BTCUSDT", 1_000 + LATENCY_ALERT_THROTTLE_SECS));
     }
 }
