@@ -6,6 +6,7 @@ use trading_core::{MarketEvent, ObservedMarketEvent};
 use trading_exchange::MarketStream;
 
 use crate::market_repository::persist_observed_market_event;
+use crate::notify_format;
 use crate::risk_event_repository::{
     persist_market_latency_risk_event, MARKET_DATA_LATENCY_THRESHOLD_MS,
 };
@@ -99,11 +100,10 @@ pub async fn run_market_ingestion_with_forwarder(
                     }
                     notify(
                         &notifications,
-                        format!(
-                            "market latency warning\nexchange: {}\nsymbol: {}\nlatency_ms: {}",
+                        notify_format::market_latency_warning(
                             exchange.as_str(),
-                            symbol,
-                            latency_ms
+                            &symbol.to_string(),
+                            latency_ms,
                         ),
                     )
                     .await;

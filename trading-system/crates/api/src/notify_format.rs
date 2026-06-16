@@ -152,6 +152,21 @@ pub fn account_check_failed(error: &str) -> String {
     frame("🚨 *계정 조회 실패*", &row("📝", "사유", error))
 }
 
+/// ⏱ 마켓 데이터 지연 — 진입 게이트 차단(non-locking warn).
+pub fn market_latency_warning(
+    exchange: &str,
+    symbol: &str,
+    latency_ms: impl std::fmt::Display,
+) -> String {
+    let body = format!(
+        "{}{}{}",
+        row("🏦", "거래소", exchange),
+        row("🪙", "심볼", symbol),
+        row("⏱", "지연(ms)", &latency_ms.to_string()),
+    );
+    frame("⏱ *마켓 지연 — 진입 차단*", &body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +200,18 @@ mod tests {
     fn reconciled_variants_state_outcome() {
         assert!(entry_reconciled_filled("ETHUSDT", "Buy", "0.05").contains("보호주문 발주 중"));
         assert!(entry_reconciled_not_filled("ETHUSDT", "Buy").contains("안전하게 건너뜀"));
+    }
+
+    #[test]
+    fn market_latency_warning_wraps_underscored_label_value_safely() {
+        // Regression: the old plain-text message had a bare `latency_ms:` whose
+        // underscore broke Markdown parsing once parse_mode was enabled. The
+        // formatted version code-wraps every value, so no stray entity remains.
+        let m = market_latency_warning("Binance", "BTCUSDT", 4011);
+        assert!(m.starts_with("⏱ *마켓 지연 — 진입 차단*"));
+        assert!(m.contains("⏱ 지연(ms): `4011`"));
+        // The asterisks are balanced (title only) and there are no unbalanced
+        // backticks: every backtick opens and closes a value span.
+        assert_eq!(m.matches('`').count() % 2, 0);
     }
 }

@@ -30,15 +30,33 @@ impl TelegramClient {
     }
 
     pub async fn send_message(&self, chat_id: i64, text: impl Into<String>) -> Result<()> {
+        // Try Markdown first (rich alerts). If Telegram rejects the entities
+        // (a stray `*`/`_`/`` ` `` in an error string or exchange-supplied value
+        // can break parsing), retry the SAME text as plain text so the alert is
+        // never lost — a delivered ugly message beats a dropped critical one.
+        let text = text.into();
+        match self.post_message(chat_id, &text, true).await {
+            Ok(()) => Ok(()),
+            Err(markdown_error) => {
+                tracing::warn!(%markdown_error, "Telegram Markdown send failed; retrying as plain text");
+                self.post_message(chat_id, &text, false).await
+            }
+        }
+    }
+
+    async fn post_message(&self, chat_id: i64, text: &str, markdown: bool) -> Result<()> {
+        let mut body = json!({
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": true
+        });
+        if markdown {
+            body["parse_mode"] = json!("Markdown");
+        }
         let response = self
             .client
             .post(format!("{}/sendMessage", self.base_url))
-            .json(&json!({
-                "chat_id": chat_id,
-                "text": text.into(),
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": true
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|error| TradingError::Exchange(reqwest_error_message(error)))?;
