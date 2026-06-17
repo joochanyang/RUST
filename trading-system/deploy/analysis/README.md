@@ -119,7 +119,7 @@ This is exactly the "statistical vs economic significance" warning above: predic
 power exists, but a fixed-H taker round trip cannot monetise a sub-1-bps edge.
 
 ⚠️ This is **SINGLE-REGIME smoke** (~2 days), not a final verdict — but the failure
-margin (~25×) is so large that a regime shift is very unlikely to flip it. An honest
+margin (~25×) is so large that a regime shift is unlikely to flip it. An honest
 PASS would need the same backtest re-run after weeks accumulate, with walk-forward
 in-sample/out-of-sample windows (pre-reg §8.2). Per pre-reg §8.4, a signal study that
 dies under cost ⇒ **STOP** rather than tuning variants into a false positive. A maker-
