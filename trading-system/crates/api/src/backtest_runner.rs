@@ -1850,4 +1850,51 @@ mod tests {
         );
         walk_forward_breakout_daily(&pool).await;
     }
+
+    /// Imbalance fixed-H backtest runner. NOT a pass/fail unit test — a permanent
+    /// #[ignore]-d probe that runs deploy/analysis/imbalance_backtest.sql against the
+    /// DB in DATABASE_URL (local dev / SSH-forwarded capture / synthetic) and prints
+    /// the net-return table. The authoritative 18-feed run is done on the capture host
+    /// via `docker exec trading-capture-postgres psql -U trading -d trading_system < imbalance_backtest.sql`.
+    ///
+    /// Run: `DATABASE_URL=… cargo test -p trading-api --bin trading-api \
+    ///       backtest_runner::tests::imbalance_backtest_smoke -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "imbalance backtest replay over an order_books DB; run explicitly"]
+    async fn imbalance_backtest_smoke() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping imbalance backtest; DATABASE_URL is not set");
+            return;
+        };
+        let sql = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/analysis/imbalance_backtest.sql"
+        ))
+        .expect("read imbalance_backtest.sql");
+
+        // Temp tables are session-scoped: strip psql meta-commands (\set, \timing,
+        // \echo) the server can't parse and run the whole batch on ONE connection.
+        let sql_no_meta: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('\\'))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("connect order_books database");
+        let mut conn = pool.acquire().await.expect("acquire single connection");
+
+        use sqlx::Executor;
+        eprintln!("=== Imbalance fixed-H backtest (net of 2×(5bps+half-spread), 1x/2x/3x) ===");
+        conn.execute(sqlx::raw_sql(&sql_no_meta))
+            .await
+            .expect("imbalance_backtest.sql batch failed");
+        eprintln!(
+            "backtest SQL executed. For the printed result table, run the authoritative version:\n  \
+             docker exec -i trading-capture-postgres psql -U trading -d trading_system < deploy/analysis/imbalance_backtest.sql"
+        );
+    }
 }
